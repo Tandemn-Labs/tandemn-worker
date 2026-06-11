@@ -1,0 +1,5 @@
+# Python
+.mypy_cache/
+.ruff_cache/
+uv.lock
+.venv/
