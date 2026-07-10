@@ -11,12 +11,13 @@ import sys
 LOGGER = logging.getLogger(__name__)
 
 
+# TODO: Figure out env vars for vLLM
 def build_vllm_command() -> list[str]:
     """Build the `vllm serve` command from environment variables."""
-    model = os.environ.get("VLLM_MODEL", "")
-    host = os.environ.get("VLLM_HOST", "0.0.0.0")
-    port = os.environ.get("VLLM_PORT", "8000")
-    extra_args = shlex.split(os.environ.get("VLLM_EXTRA_ARGS", ""))
+    model = os.environ.get("TD_VLLM_MODEL", "")
+    host = os.environ.get("TD_VLLM_HOST", "0.0.0.0")
+    port = os.environ.get("TD_VLLM_PORT", "8000")
+    extra_args = shlex.split(os.environ.get("TD_VLLM_EXTRA_ARGS", ""))
 
     return ["vllm", "serve", model, "--host", host, "--port", port, *extra_args]
 
