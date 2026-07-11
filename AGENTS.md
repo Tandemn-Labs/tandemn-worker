@@ -36,8 +36,8 @@ Current repo: tandemn-labs/tandemn-worker
 
 ## Repo-specific guide
 
-This repository contains the code for the vLLM batched inference worker that will run as jobs in Kubernetes. The worker processes chunks, where each chunk consists of a number of prompts. The worker will pull chunks from some cloud storage, and chunk assignment is requested from an external chunk manager service. For each chunk, the worker submits individual prompts in the chunk to the vLLM engine and write the output as a complete chunk to the same cloud storage.
+This repository contains the code for the vLLM batched inference worker that will run as jobs in Kubernetes. The driver processes chunks, where each chunk consists of a number of prompts. The driver will pull chunks from some cloud storage, and chunk assignment is requested from an external chunk manager service. For each chunk, the driver submits individual prompts in the chunk to the vLLM engine and write the output as a complete chunk to the same cloud storage.
 
-The vLLM server is invoked using the CLI `vllm serve`, so that metrics can be exposed. `supervisor.py` is the init script, and spawns 2 processes - the `vllm serve` engine and `batch_worker.py`, which will drive the vLLM engine.
+The vLLM server is invoked using the CLI `vllm serve`, so that metrics can be exposed. `supervisor.py` is the init script and lifecycle owner, spawning 2 processes - the `vllm serve` engine and `batch_driver.py`, which will drive the vLLM engine.
 
 The Kubernetes deployment is split into 2 cases - A: pipelism parallelism = 1 or B: pipeline parallelism > 1. For case A, the 2 processes are wrapped in 1 container.

@@ -1,4 +1,4 @@
-"""Batch inference worker entrypoint."""
+"""Batch inference driver entrypoint."""
 
 import asyncio
 import logging
@@ -17,7 +17,7 @@ NO_CHUNK_BACKOFF_SECONDS = float(os.getenv("TD_NO_CHUNK_BACKOFF_SECONDS", "1"))
 
 @dataclass(slots=True)
 class InputChunk:
-    """A chunk claimed by this worker and ready for inference."""
+    """A chunk claimed by this driver and ready for inference."""
 
     chunk_id: str
     prompts: list[str]
@@ -32,14 +32,18 @@ class OutputChunk:
 
 
 async def main() -> None:
-    """Run the batch worker event loop until shutdown is requested."""
+    """Run the batch driver event loop until shutdown is requested."""
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(signum, shutdown_event.set)
+    def request_shutdown() -> None:
+        # TODO: stop intake and flush safely completed work before exiting.
+        shutdown_event.set()
 
-    LOGGER.info("Batch worker started")
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(signum, request_shutdown)
+
+    LOGGER.info("Batch driver started")
 
     chunk_sem = asyncio.BoundedSemaphore(NUM_LOCAL_CHUNK)
     input_chunk_queue: asyncio.Queue[InputChunk] = asyncio.Queue(maxsize=NUM_LOCAL_CHUNK)
@@ -52,8 +56,8 @@ async def main() -> None:
             name="chunk-puller",
         ),
         asyncio.create_task(
-            prompt_worker(chunk_sem, input_chunk_queue, output_chunk_queue, shutdown_event),
-            name="prompt-worker",
+            prompt_driver(chunk_sem, input_chunk_queue, output_chunk_queue, shutdown_event),
+            name="prompt-driver",
         ),
         asyncio.create_task(
             chunk_writer(output_chunk_queue, shutdown_event),
@@ -69,7 +73,7 @@ async def main() -> None:
         task.cancel()  # TODO: check this behaviour
 
     await asyncio.gather(*tasks, return_exceptions=True)  # TODO: check this too
-    LOGGER.info("Batch worker shutting down")
+    LOGGER.info("Batch driver shutting down")
 
 
 async def chunk_puller(
@@ -95,7 +99,7 @@ async def chunk_puller(
         await input_chunk_queue.put(chunk)
 
 
-async def prompt_worker(
+async def prompt_driver(
     chunk_sem: asyncio.BoundedSemaphore,
     input_chunk_queue: asyncio.Queue[InputChunk],
     output_chunk_queue: asyncio.Queue[OutputChunk],
@@ -129,17 +133,20 @@ async def chunk_writer(
 
 async def get_chunk() -> InputChunk | None:
     """Claim the next chunk from the chunk manager and download it from storage."""
-    raise NotImplementedError
+    # TODO
+    return None
 
 
 async def process_chunk(chunk: InputChunk) -> OutputChunk:
     """Submit all prompts in a chunk to vLLM and collect their outputs."""
-    raise NotImplementedError
+    # TODO
+    return OutputChunk("", [])
 
 
 async def put_chunk(completed_chunk: OutputChunk) -> None:
     """Write a completed chunk to external storage."""
-    raise NotImplementedError
+    # TODO
+    return None
 
 
 if __name__ == "__main__":
