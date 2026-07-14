@@ -1,6 +1,7 @@
 """Batch inference driver entrypoint."""
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -9,6 +10,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import IntEnum
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -28,8 +30,6 @@ VLLM_READY_TIMEOUT_SECONDS = float(os.getenv("TD_VLLM_READY_TIMEOUT_SECONDS", "6
 VLLM_READY_INTERVAL_SECONDS = float(os.getenv("TD_VLLM_READY_INTERVAL_SECONDS", "3"))
 VLLM_HEALTH_TIMEOUT_SECONDS = float(os.getenv("TD_VLLM_HEALTH_TIMEOUT_SECONDS", "1"))
 VLLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("TD_VLLM_REQUEST_TIMEOUT_SECONDS", "120"))
-VLLM_MODEL = os.getenv("TD_VLLM_MODEL", "")
-VLLM_MAX_TOKENS = int(os.getenv("TD_VLLM_MAX_TOKENS", "1024"))
 MAX_INFLIGHT_PROMPTS = int(os.getenv("TD_MAX_INFLIGHT_PROMPTS", "100"))
 
 
@@ -348,40 +348,65 @@ async def submit_prompt(
     prompt_index: int,
     prompt: str,
 ) -> PromptResult:
-    """Submit one prompt to vLLM and preserve its chunk location."""
-    output = await call_vllm(client, prompt)
-    return PromptResult(chunk=chunk, prompt_index=prompt_index, output=output)
+    """Submit one Batch JSONL request to vLLM and preserve its chunk location."""
+    request = json.loads(prompt)
+    if not isinstance(request, dict):
+        raise RuntimeError("Batch request line is not a JSON object")
 
+    custom_id = request.get("custom_id")
+    if not isinstance(custom_id, str):
+        raise RuntimeError("Batch request does not contain custom_id")
 
-async def call_vllm(client: httpx.AsyncClient, prompt: str) -> str:
-    """Call the vLLM OpenAI-compatible completions endpoint."""
-    response = await client.post(
-        f"{VLLM_BASE_URL.rstrip('/')}/v1/completions",
-        json={
-            "model": VLLM_MODEL,
-            "prompt": prompt,
-            "max_tokens": VLLM_MAX_TOKENS,
-        },
+    method = request.get("method")
+    if method != "POST":
+        raise RuntimeError("Batch request method must be POST")
+
+    url = request.get("url")
+    if not isinstance(url, str) or not url.startswith("/v1/"):
+        raise RuntimeError("Batch request url must be a relative /v1/ path")
+
+    body = request.get("body")
+    if not isinstance(body, dict):
+        raise RuntimeError("Batch request body is not a JSON object")
+
+    response_payload: object | None
+    error_payload: object | None
+
+    try:
+        response = await client.post(f"{VLLM_BASE_URL.rstrip('/')}{url}", json=body)
+        response.raise_for_status()
+    except httpx.TimeoutException as exc:
+        message = str(exc) or f"Request timed out after {VLLM_REQUEST_TIMEOUT_SECONDS:g} seconds"
+        response_payload = None
+        error_payload = {
+            "type": exc.__class__.__name__,
+            "message": message,
+        }
+    except httpx.HTTPError as exc:
+        response_payload = None
+        error_payload = {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+        }
+    else:
+        response_payload = {
+            "status_code": response.status_code,
+            "request_id": response.headers.get("x-request-id"),
+            "body": response.json(),
+        }
+        error_payload = None
+
+    output = {
+        "id": f"batch_req_{chunk.chunk_id}_{prompt_index}",
+        "custom_id": custom_id,
+        "response": response_payload,
+        "error": error_payload,
+    }
+    return PromptResult(
+        chunk=chunk,
+        prompt_index=prompt_index,
+        output=json.dumps(output, separators=(",", ":")),
     )
-    response.raise_for_status()
-
-    response_body = response.json()
-    if not isinstance(response_body, dict):
-        raise RuntimeError("vLLM response body is not a JSON object")
-
-    choices = response_body.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeError("vLLM response body does not contain choices")
-
-    choice = choices[0]
-    if not isinstance(choice, dict):
-        raise RuntimeError("vLLM response choice is not a JSON object")
-
-    text = choice.get("text")
-    if not isinstance(text, str):
-        raise RuntimeError("vLLM response choice does not contain text")
-
-    return text
 
 
 async def wait_for_vllm_ready(runtime: DriverRuntime) -> int:
@@ -435,16 +460,33 @@ async def chunk_writer(output_chunk_queue: asyncio.Queue[OutputChunk]) -> None:
             output_chunk_queue.task_done()  # For Queue.join()
 
 
+LOCAL_CHUNK_DIR = Path(__file__).resolve().parents[2] / "test"
+LOCAL_CHUNK_PREFIX = "stress_5000"
+LOCAL_CHUNK_LIMIT = 10
+_next_local_chunk_index = 1
+
+
 async def get_chunk() -> InputChunk | None:
     """Claim the next chunk from the chunk manager and download it from storage."""
-    # TODO
-    return None
+    global _next_local_chunk_index
+
+    if _next_local_chunk_index > LOCAL_CHUNK_LIMIT:
+        return None
+
+    chunk_path = LOCAL_CHUNK_DIR / f"{LOCAL_CHUNK_PREFIX}_{_next_local_chunk_index}.jsonl"
+    _next_local_chunk_index += 1
+    prompts = await asyncio.to_thread(lambda: chunk_path.read_text().splitlines())
+    return InputChunk(chunk_id=chunk_path.name, prompts=prompts)
 
 
 async def put_chunk(completed_chunk: OutputChunk) -> None:
     """Write a completed chunk to external storage."""
-    # TODO
-    return None
+    output_path = LOCAL_CHUNK_DIR / Path(completed_chunk.chunk_id).with_suffix(".output").name
+    output_text = "\n".join(completed_chunk.outputs)
+    if output_text:
+        output_text += "\n"
+
+    await asyncio.to_thread(output_path.write_text, output_text)
 
 
 if __name__ == "__main__":

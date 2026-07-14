@@ -4,3 +4,6 @@
 uv.lock
 .venv/
 __pycache__/
+
+# Other misc
+test/
