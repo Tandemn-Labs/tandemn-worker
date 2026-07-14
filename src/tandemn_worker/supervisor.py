@@ -16,6 +16,9 @@ LOGGER = logging.getLogger(__name__)
 ChildExit = tuple[str, int]  # E.g. ("batch driver", 0)
 SIGTERM_TIMEOUT_SECONDS = 30.0  # Does not always escalate SIGTERM to SIGKILL
 SIGKILL_TIMEOUT_SECONDS = 5.0
+DRIVER_GRACE_TIMEOUT_SECONDS = float(
+    os.getenv("TD_DRIVER_GRACE_TIMEOUT_SECONDS", str(SIGTERM_TIMEOUT_SECONDS))
+)
 
 
 # TODO: Figure out env vars for vLLM
@@ -66,10 +69,11 @@ def wait_for_remaining_child(
     events: queue.Queue[ChildExit],
     remaining_process: subprocess.Popen[bytes],
     remaining_name: str,
+    timeout_seconds: float = SIGTERM_TIMEOUT_SECONDS,
 ) -> None:
     """Wait briefly for the remaining child, then force kill it."""
     try:
-        proc_name, _ = events.get(timeout=SIGTERM_TIMEOUT_SECONDS)
+        proc_name, _ = events.get(timeout=timeout_seconds)
         if proc_name == remaining_name:
             return
         else:
@@ -83,7 +87,7 @@ def wait_for_remaining_child(
         LOGGER.warning(
             "%s did not exit within %.1f seconds; force terminating",
             remaining_name,
-            SIGTERM_TIMEOUT_SECONDS,
+            timeout_seconds,
         )
         signal_process(remaining_process, remaining_name, signal.SIGKILL)
 
@@ -123,10 +127,24 @@ def main() -> int:
     def handle_shutdown(signum: int, _frame: object) -> None:
         nonlocal shutdown_signal
         if shutdown_signal is None:
-            LOGGER.info("Received signal %s; terminating child processes", signum)
+            LOGGER.info("Received signal %s; gracefully terminating batch driver", signum)
             shutdown_signal = signum
             signal_process(driver_proc, "batch driver", signal.SIGTERM)
-            signal_process(vllm_proc, "vLLM server", signal.SIGTERM)
+
+            def force_kill_driver_after_grace() -> None:
+                time.sleep(DRIVER_GRACE_TIMEOUT_SECONDS)
+                if driver_proc.poll() is None:
+                    LOGGER.warning(
+                        "Batch driver did not exit within %.1f seconds; force terminating",
+                        DRIVER_GRACE_TIMEOUT_SECONDS,
+                    )
+                    signal_process(driver_proc, "batch driver", signal.SIGKILL)
+
+            threading.Thread(
+                target=force_kill_driver_after_grace,
+                name="force-kill-batch-driver",
+                daemon=True,
+            ).start()
 
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
@@ -137,10 +155,21 @@ def main() -> int:
     # External termination signal received + handled (propagate to children)
     if shutdown_signal is not None:
         if child_name == "batch driver":
+            signal_process(vllm_proc, "vLLM server", signal.SIGTERM)
             wait_for_remaining_child(child_events, vllm_proc, "vLLM server")
         else:
-            wait_for_remaining_child(child_events, driver_proc, "batch driver")
+            LOGGER.error(
+                "vLLM server exited before batch driver drained; stopping driver immediately"
+            )
+            signal_process(driver_proc, "batch driver", signal.SIGUSR1)
+            wait_for_remaining_child(
+                child_events,
+                driver_proc,
+                "batch driver",
+            )
         return 128 + shutdown_signal
+
+    # Below cases occur if either child terminates without external signal
 
     # Case 1: If batch driver is the one that terminates first
     if child_name == "batch driver":
@@ -161,7 +190,7 @@ def main() -> int:
         "vLLM server exited unexpectedly with code %s; terminating batch driver",
         return_code,
     )
-    signal_process(driver_proc, "batch driver", signal.SIGTERM)
+    signal_process(driver_proc, "batch driver", signal.SIGUSR1)
     wait_for_remaining_child(child_events, driver_proc, "batch driver")
     return return_code or 1
 
