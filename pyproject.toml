@@ -4,7 +4,10 @@ version = "0.0.1"
 description = "The code for the GPU worker containers that will live on the accelerated nodes in Kubernetes."
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi",
     "httpx",
+    "prometheus-client",
+    "uvicorn",
 ]
 
 [project.optional-dependencies]

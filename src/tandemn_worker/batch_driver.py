@@ -14,6 +14,15 @@ from pathlib import Path
 from typing import cast
 
 import httpx
+import uvicorn
+from fastapi import FastAPI, Response
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    generate_latest,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +40,11 @@ VLLM_READY_INTERVAL_SECONDS = float(os.getenv("TD_VLLM_READY_INTERVAL_SECONDS", 
 VLLM_HEALTH_TIMEOUT_SECONDS = float(os.getenv("TD_VLLM_HEALTH_TIMEOUT_SECONDS", "1"))
 VLLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("TD_VLLM_REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_INFLIGHT_PROMPTS = int(os.getenv("TD_MAX_INFLIGHT_PROMPTS", "100"))
+
+# Metrics-related
+METRICS_HOST = os.getenv("TD_METRICS_HOST", "0.0.0.0")
+METRICS_PORT = int(os.getenv("TD_METRICS_PORT", "9000"))
+METRICS_PATH = os.getenv("TD_METRICS_PATH", "/metrics")
 
 
 @dataclass(slots=True)
@@ -122,6 +136,15 @@ class PromptResult:
     output: str
 
 
+@dataclass(slots=True)
+class DriverMetrics:
+    """Prometheus metrics updated by the batch driver."""
+
+    # Updated in 2 places in prompt_driver. When it finishes pumping reqs, and before processing done reqs
+    inflight_requests: Gauge
+    requests_processed: Counter
+
+
 async def main() -> int:
     """Run the batch driver event loop until shutdown is requested."""
     runtime = DriverRuntime(shutdown_event=asyncio.Event())
@@ -142,6 +165,13 @@ async def main() -> int:
     input_chunk_queue: asyncio.Queue[InputChunk] = asyncio.Queue(maxsize=NUM_LOCAL_CHUNK)
     # Bound set to 3 times the input, could be changed.
     output_chunk_queue: asyncio.Queue[OutputChunk] = asyncio.Queue(maxsize=NUM_LOCAL_CHUNK * 3)
+    metrics_app, metrics = create_metrics_app(
+        input_chunk_queue,
+        output_chunk_queue,
+    )
+    metrics_server, metrics_server_task = start_metrics_server(
+        metrics_app,
+    )
 
     chunk_puller_task = asyncio.create_task(
         chunk_puller(
@@ -153,7 +183,7 @@ async def main() -> int:
         name="chunk-puller",
     )
     prompt_driver_task = asyncio.create_task(
-        prompt_driver(chunk_sem, input_chunk_queue, output_chunk_queue, runtime),
+        prompt_driver(chunk_sem, input_chunk_queue, output_chunk_queue, runtime, metrics),
         name="prompt-driver",
     )
     chunk_writer_task = asyncio.create_task(
@@ -175,6 +205,7 @@ async def main() -> int:
             await output_chunk_queue.join()
             chunk_writer_task.cancel()
             await asyncio.gather(chunk_writer_task, return_exceptions=True)
+            await stop_metrics_server(metrics_server, metrics_server_task)
             LOGGER.info("Batch driver shutting down with return code %s", runtime.return_code)
             return runtime.return_code
 
@@ -182,8 +213,83 @@ async def main() -> int:
         task.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
+    await stop_metrics_server(metrics_server, metrics_server_task)
     LOGGER.info("Batch driver shutting down with return code %s", runtime.return_code)
     return runtime.return_code
+
+
+def create_metrics_app(
+    input_chunk_queue: asyncio.Queue[InputChunk],
+    output_chunk_queue: asyncio.Queue[OutputChunk],
+) -> tuple[FastAPI, DriverMetrics]:
+    """Create the FastAPI app exposing driver metrics in Prometheus format."""
+    registry = CollectorRegistry()
+
+    input_queue_gauge = Gauge(
+        "batched_input_chunk_queue_size",
+        "Number of input chunks waiting for prompt scheduling.",
+        registry=registry,
+    )
+    input_queue_gauge.set_function(input_chunk_queue.qsize)
+
+    output_queue_gauge = Gauge(
+        "batched_output_chunk_queue_size",
+        "Number of completed chunks waiting to be written.",
+        registry=registry,
+    )
+    output_queue_gauge.set_function(output_chunk_queue.qsize)
+
+    inflight_requests = Gauge(
+        "batched_inflight_requests",
+        "Number of prompt requests currently in flight.",
+        registry=registry,
+    )
+
+    requests_processed = Counter(
+        "batched_requests_processed",
+        "Total number of prompt requests that have received a response.",
+        registry=registry,
+    )
+
+    metrics = DriverMetrics(
+        inflight_requests=inflight_requests,
+        requests_processed=requests_processed,
+    )
+
+    app = FastAPI()
+    metrics_path = f"/{METRICS_PATH.strip('/')}" if METRICS_PATH.strip("/") else "/metrics"
+
+    @app.get(metrics_path, include_in_schema=False)
+    async def metrics_endpoint() -> Response:
+        return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+
+    return app, metrics
+
+
+def start_metrics_server(app: FastAPI) -> tuple[uvicorn.Server, asyncio.Task[None]]:
+    """Start the metrics ASGI server in the current event loop."""
+    config = uvicorn.Config(
+        app,
+        host=METRICS_HOST,
+        port=METRICS_PORT,
+        log_level="warning",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve(), name="metrics-server")
+    LOGGER.info(
+        "Batched metrics endpoint listening on http://%s:%s%s",
+        METRICS_HOST,
+        METRICS_PORT,
+        METRICS_PATH,
+    )
+    return server, task
+
+
+async def stop_metrics_server(server: uvicorn.Server, task: asyncio.Task[None]) -> None:
+    """Request a graceful metrics server shutdown."""
+    server.should_exit = True
+    await asyncio.gather(task, return_exceptions=True)
 
 
 async def chunk_puller(
@@ -228,6 +334,7 @@ async def prompt_driver(
     input_chunk_queue: asyncio.Queue[InputChunk],
     output_chunk_queue: asyncio.Queue[OutputChunk],
     runtime: DriverRuntime,
+    metrics: DriverMetrics,
 ) -> None:
     """Submit chunk prompts to vLLM and enqueue completed chunks for writing."""
     shutdown_event = runtime.shutdown_event
@@ -290,6 +397,7 @@ async def prompt_driver(
                         name=f"prompt-{current_chunk.chunk_id}-{prompt_index}",
                     )
                     inflight.add(prompt_task)
+                    metrics.inflight_requests.set(len(inflight))
 
                     # So that current_chunk is not None when passed into task
                     if current_chunk.next_prompt_index >= len(current_chunk.prompts):
@@ -311,6 +419,7 @@ async def prompt_driver(
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 inflight = pending
+                metrics.inflight_requests.set(len(inflight))
 
                 for task in done:
                     try:
@@ -322,6 +431,7 @@ async def prompt_driver(
                         )
                         return
 
+                    metrics.requests_processed.inc()
                     chunk = result.chunk
                     chunk.outputs[result.prompt_index] = result.output
                     chunk.remaining_prompts -= 1
@@ -340,8 +450,10 @@ async def prompt_driver(
                 task.cancel()
 
             await asyncio.gather(*inflight, return_exceptions=True)
+            metrics.inflight_requests.set(0)
 
 
+# TODO: Prevent runtime errors
 async def submit_prompt(
     client: httpx.AsyncClient,
     chunk: ActiveChunk,
