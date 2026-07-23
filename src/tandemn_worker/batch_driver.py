@@ -143,6 +143,8 @@ class DriverMetrics:
     # Updated in 2 places in prompt_driver. When it finishes pumping reqs, and before processing done reqs
     inflight_requests: Gauge
     requests_processed: Counter
+    input_chunks_pulled: Counter
+    output_chunks_written: Counter
 
 
 async def main() -> int:
@@ -165,10 +167,7 @@ async def main() -> int:
     input_chunk_queue: asyncio.Queue[InputChunk] = asyncio.Queue(maxsize=NUM_LOCAL_CHUNK)
     # Bound set to 3 times the input, could be changed.
     output_chunk_queue: asyncio.Queue[OutputChunk] = asyncio.Queue(maxsize=NUM_LOCAL_CHUNK * 3)
-    metrics_app, metrics = create_metrics_app(
-        input_chunk_queue,
-        output_chunk_queue,
-    )
+    metrics_app, metrics = create_metrics_app()
     metrics_server, metrics_server_task = start_metrics_server(
         metrics_app,
     )
@@ -179,6 +178,7 @@ async def main() -> int:
             input_chunk_queue,
             output_chunk_queue,
             runtime.shutdown_event,
+            metrics,
         ),
         name="chunk-puller",
     )
@@ -187,7 +187,7 @@ async def main() -> int:
         name="prompt-driver",
     )
     chunk_writer_task = asyncio.create_task(
-        chunk_writer(output_chunk_queue),
+        chunk_writer(output_chunk_queue, metrics),
         name="chunk-writer",
     )
     tasks = [chunk_puller_task, prompt_driver_task, chunk_writer_task]
@@ -218,42 +218,39 @@ async def main() -> int:
     return runtime.return_code
 
 
-def create_metrics_app(
-    input_chunk_queue: asyncio.Queue[InputChunk],
-    output_chunk_queue: asyncio.Queue[OutputChunk],
-) -> tuple[FastAPI, DriverMetrics]:
+def create_metrics_app() -> tuple[FastAPI, DriverMetrics]:
     """Create the FastAPI app exposing driver metrics in Prometheus format."""
     registry = CollectorRegistry()
 
-    input_queue_gauge = Gauge(
-        "batched_input_chunk_queue_size",
-        "Number of input chunks waiting for prompt scheduling.",
-        registry=registry,
-    )
-    input_queue_gauge.set_function(input_chunk_queue.qsize)
-
-    output_queue_gauge = Gauge(
-        "batched_output_chunk_queue_size",
-        "Number of completed chunks waiting to be written.",
-        registry=registry,
-    )
-    output_queue_gauge.set_function(output_chunk_queue.qsize)
-
     inflight_requests = Gauge(
-        "batched_inflight_requests",
+        "batched_reqs_inflight",
         "Number of prompt requests currently in flight.",
         registry=registry,
     )
 
     requests_processed = Counter(
-        "batched_requests_processed",
+        "batched_reqs_processed",
         "Total number of prompt requests that have received a response.",
+        registry=registry,
+    )
+
+    input_chunks_pulled = Counter(
+        "batched_chunks_input_pulled",
+        "Total number of input chunks pulled.",
+        registry=registry,
+    )
+
+    output_chunks_written = Counter(
+        "batched_chunks_output_written",
+        "Total number of output chunks written.",
         registry=registry,
     )
 
     metrics = DriverMetrics(
         inflight_requests=inflight_requests,
         requests_processed=requests_processed,
+        input_chunks_pulled=input_chunks_pulled,
+        output_chunks_written=output_chunks_written,
     )
 
     app = FastAPI()
@@ -297,6 +294,7 @@ async def chunk_puller(
     input_chunk_queue: asyncio.Queue[InputChunk],
     output_chunk_queue: asyncio.Queue[OutputChunk],
     shutdown_event: asyncio.Event,
+    metrics: DriverMetrics,
 ) -> None:
     """Claim chunks up to the local chunk limit without busy waiting."""
     while not shutdown_event.is_set():
@@ -321,6 +319,9 @@ async def chunk_puller(
                 )
             continue
 
+        metrics.input_chunks_pulled.inc()
+
+        # Immediately write empty output chunk if input chunk is empty
         if not chunk.prompts:
             await output_chunk_queue.put(OutputChunk(chunk_id=chunk.chunk_id))
             chunk_sem.release()
@@ -561,13 +562,17 @@ async def wait_for_vllm_ready(runtime: DriverRuntime) -> int:
     return 2
 
 
-async def chunk_writer(output_chunk_queue: asyncio.Queue[OutputChunk]) -> None:
+async def chunk_writer(
+    output_chunk_queue: asyncio.Queue[OutputChunk],
+    metrics: DriverMetrics,
+) -> None:
     """Write completed chunks to external storage."""
     while True:
         completed_chunk = await output_chunk_queue.get()
 
         try:
             await put_chunk(completed_chunk)
+            metrics.output_chunks_written.inc()
         finally:
             output_chunk_queue.task_done()  # For Queue.join()
 
