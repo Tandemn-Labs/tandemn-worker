@@ -1,0 +1,199 @@
+syntax = "proto3";
+
+package tandemn.chunkmanager.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/tandemn-labs/chunk-manager/gen/go/tandemn/chunkmanager/v1;chunkmanagerv1";
+
+service PlannerService {
+  rpc CreateJob(CreateJobRequest) returns (CreateJobResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc RegisterChunks(RegisterChunksRequest) returns (RegisterChunksResponse);
+  rpc FinalizeJobRegistration(FinalizeJobRegistrationRequest) returns (FinalizeJobRegistrationResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  rpc AddChainAssociation(AddChainAssociationRequest) returns (AddChainAssociationResponse);
+  rpc DrainChainAssociation(DrainChainAssociationRequest) returns (DrainChainAssociationResponse);
+}
+
+service WorkerService {
+  rpc ClaimChunks(ClaimChunksRequest) returns (ClaimChunksResponse);
+  rpc RenewLeases(RenewLeasesRequest) returns (RenewLeasesResponse);
+  rpc CompleteChunk(CompleteChunkRequest) returns (CompleteChunkResponse);
+  rpc FailChunk(FailChunkRequest) returns (FailChunkResponse);
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_PENDING = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_SUCCEEDED = 3;
+  JOB_STATE_FAILED = 4;
+  JOB_STATE_CANCELLED = 5;
+}
+
+enum ChainState {
+  CHAIN_STATE_UNSPECIFIED = 0;
+  CHAIN_STATE_ACTIVE = 1;
+  CHAIN_STATE_DRAINING = 2;
+}
+
+message Job {
+  string job_id = 1;
+  JobState state = 2;
+  int64 total_chunk_count = 3;
+  int64 succeeded_chunk_count = 4;
+  int64 failed_chunk_count = 5;
+  int32 max_retries = 6;
+  google.protobuf.Duration retry_backoff = 7;
+  google.protobuf.Duration lease_duration = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp registration_completed_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  google.protobuf.Timestamp terminal_at = 12;
+}
+
+message ChainIdentity {
+  string job_id = 1;
+  string rank_id = 2;
+  int64 chain_id = 3;
+}
+
+message ChainAssociation {
+  ChainIdentity identity = 1;
+  ChainState state = 2;
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp draining_at = 4;
+}
+
+message ChunkRegistration {
+  int64 chunk_id = 1;
+  string input_ref = 2;
+}
+
+message ChunkLease {
+  int64 chunk_id = 1;
+  string input_ref = 2;
+  int64 generation = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  int32 retry_count = 5;
+}
+
+message LeaseReference {
+  int64 chunk_id = 1;
+  int64 generation = 2;
+}
+
+message RenewedLease {
+  LeaseReference lease = 1;
+  google.protobuf.Timestamp expires_at = 2;
+}
+
+message CreateJobRequest {
+  string job_id = 1;
+  int64 total_chunk_count = 2;
+  int32 max_retries = 3;
+  google.protobuf.Duration retry_backoff = 4;
+  google.protobuf.Duration lease_duration = 5;
+}
+
+message CreateJobResponse {
+  Job job = 1;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message GetJobResponse {
+  Job job = 1;
+}
+
+message RegisterChunksRequest {
+  string job_id = 1;
+  repeated ChunkRegistration chunks = 2;
+}
+
+message RegisterChunksResponse {
+  int32 registered_count = 1;
+}
+
+message FinalizeJobRegistrationRequest {
+  string job_id = 1;
+}
+
+message FinalizeJobRegistrationResponse {
+  Job job = 1;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message CancelJobResponse {
+  Job job = 1;
+}
+
+message AddChainAssociationRequest {
+  ChainIdentity chain = 1;
+}
+
+message AddChainAssociationResponse {
+  ChainAssociation association = 1;
+}
+
+message DrainChainAssociationRequest {
+  ChainIdentity chain = 1;
+}
+
+message DrainChainAssociationResponse {
+  ChainAssociation association = 1;
+}
+
+message ClaimChunksRequest {
+  ChainIdentity chain = 1;
+  int32 max_chunks = 2;
+}
+
+message ClaimChunksResponse {
+  JobState job_state = 1;
+  repeated ChunkLease leases = 2;
+  google.protobuf.Timestamp database_time = 3;
+}
+
+message RenewLeasesRequest {
+  ChainIdentity chain = 1;
+  repeated LeaseReference leases = 2;
+}
+
+message RenewLeasesResponse {
+  repeated RenewedLease renewed = 1;
+  repeated LeaseReference stale = 2;
+  google.protobuf.Timestamp database_time = 3;
+}
+
+message CompleteChunkRequest {
+  ChainIdentity chain = 1;
+  LeaseReference lease = 2;
+  string output_uri = 3;
+  string checksum = 4;
+  int64 output_size_bytes = 5;
+}
+
+message CompleteChunkResponse {
+  JobState job_state = 1;
+  bool replayed = 2;
+}
+
+message FailChunkRequest {
+  ChainIdentity chain = 1;
+  LeaseReference lease = 2;
+  string failure_class = 3;
+  string message = 4;
+  bool retriable = 5;
+}
+
+message FailChunkResponse {
+  JobState job_state = 1;
+}
