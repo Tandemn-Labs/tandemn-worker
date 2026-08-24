@@ -35,13 +35,16 @@ from prometheus_client import (
 )
 
 from tandemn.chunkmanager.v1 import chunk_manager_pb2, chunk_manager_pb2_grpc
+from tandemn_worker.config import (
+    BatchDriverConfig,
+    BatchWorkerConfig,
+    ChunkManagerConfig,
+    MetricsConfig,
+    load_batch_driver_config,
+)
 
 LOGGER = logging.getLogger(__name__)
 
-# Chunk-related
-NUM_LOCAL_CHUNK = int(os.getenv("TD_NUM_LOCAL_CHUNK", "5"))  # Limit for num chunks to hold locally
-NO_CHUNK_BACKOFF_SECONDS = float(os.getenv("TD_NO_CHUNK_BACKOFF_SECONDS", "1"))
-CHUNK_MANAGER_RPC_TIMEOUT_SECONDS = float(os.getenv("TD_CHUNK_MANAGER_RPC_TIMEOUT_SECONDS", "5"))
 RPC_RETRY_INITIAL_SECONDS = 0.25
 RPC_RETRY_MAX_SECONDS = 5.0
 LEASE_RENEWAL_FRACTION = 0.5
@@ -49,22 +52,6 @@ MIN_COMPLETION_RPC_SECONDS = 0.001
 CHAIN_NOT_ACTIVE_REASON = "CHAIN_NOT_ACTIVE"
 LEASE_EXPIRED_REASON = "LEASE_EXPIRED"
 STALE_COMPLETION_REASONS = frozenset({"INVALID_STATE", "STALE_LEASE"})
-
-# vLLM-related
-VLLM_BASE_URL = os.getenv(
-    "TD_VLLM_BASE_URL",
-    f"http://127.0.0.1:{os.getenv('TD_VLLM_PORT', '8000')}",
-)
-VLLM_READY_TIMEOUT_SECONDS = float(os.getenv("TD_VLLM_READY_TIMEOUT_SECONDS", "600"))
-VLLM_READY_INTERVAL_SECONDS = float(os.getenv("TD_VLLM_READY_INTERVAL_SECONDS", "3"))
-VLLM_HEALTH_TIMEOUT_SECONDS = float(os.getenv("TD_VLLM_HEALTH_TIMEOUT_SECONDS", "1"))
-VLLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("TD_VLLM_REQUEST_TIMEOUT_SECONDS", "120"))
-MAX_INFLIGHT_PROMPTS = int(os.getenv("TD_MAX_INFLIGHT_PROMPTS", "100"))
-
-# Metrics-related
-METRICS_HOST = os.getenv("TD_METRICS_HOST", "0.0.0.0")
-METRICS_PORT = int(os.getenv("TD_METRICS_PORT", "9000"))
-METRICS_PATH = os.getenv("TD_METRICS_PATH", "/metrics")
 
 
 @dataclass(slots=True)
@@ -78,6 +65,11 @@ class DriverRuntime:
         GENERIC_ERROR = 1
         VLLM_READY_TIMEOUT = 10
 
+    # shutdown_event signals that shutdown should occur, and is registered as signal handler
+    # + called as a failure mode in some places
+    # abort_event can further interrupt that to force shutdown, only read in main()
+    # E.g. While doing graceful shutdown, the process gets stuck, this Event prevents it
+    # from blocking forever. main() in a graceful shutdown waits on abort_event and will wake
     shutdown_event: asyncio.Event
     abort_event: asyncio.Event
     return_code: int = int(ReturnCode.SUCCESS)
@@ -91,6 +83,8 @@ class DriverRuntime:
     ) -> None:
         """Request driver shutdown and track whether locally claimed work drains."""
         signal_number = None if signum is None else int(signum)
+
+        # If not explicitly specified, drain only if SIGINT/SIGTERM
         should_drain = (
             signal_number in {int(signal.SIGINT), int(signal.SIGTERM)} if drain is None else drain
         )
@@ -112,25 +106,6 @@ class DriverRuntime:
         self.shutdown_event.set()
         if not should_drain:
             self.abort_event.set()
-
-
-@dataclass(frozen=True, slots=True)
-class ChunkManagerConfig:
-    """Connection and chain identity supplied by the deployment plan."""
-
-    address: str
-    job_id: str
-    rank_id: str
-    chain_id: int
-    rpc_timeout_seconds: float
-
-    def chain_identity(self) -> chunk_manager_pb2.ChainIdentity:
-        """Build the protobuf identity reused by all worker RPCs."""
-        return chunk_manager_pb2.ChainIdentity(
-            job_id=self.job_id,
-            rank_id=self.rank_id,
-            chain_id=self.chain_id,
-        )
 
 
 @dataclass(slots=True)
@@ -259,43 +234,6 @@ class DriverMetrics:
     output_chunks_written: Counter
 
 
-def load_chunk_manager_config() -> ChunkManagerConfig:
-    """Load the chunk manager endpoint and chain identity from the environment."""
-    values = {
-        "TD_CHUNK_MANAGER_ADDRESS": os.getenv("TD_CHUNK_MANAGER_ADDRESS", "").strip(),
-        "TD_JOB_ID": os.getenv("TD_JOB_ID", "").strip(),
-        "TD_RANK_ID": os.getenv("TD_RANK_ID", "").strip(),
-        "TD_CHAIN_ID": os.getenv("TD_CHAIN_ID", "").strip(),
-    }
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
-
-    try:
-        chain_id = int(values["TD_CHAIN_ID"])
-    except ValueError as exc:
-        raise ValueError("TD_CHAIN_ID must be an integer") from exc
-
-    if chain_id < 0:
-        raise ValueError("TD_CHAIN_ID must be non-negative")
-    if CHUNK_MANAGER_RPC_TIMEOUT_SECONDS <= 0:
-        raise ValueError("TD_CHUNK_MANAGER_RPC_TIMEOUT_SECONDS must be positive")
-    if NO_CHUNK_BACKOFF_SECONDS <= 0:
-        raise ValueError("TD_NO_CHUNK_BACKOFF_SECONDS must be positive")
-    if NUM_LOCAL_CHUNK <= 0:
-        raise ValueError("TD_NUM_LOCAL_CHUNK must be positive")
-    if MAX_INFLIGHT_PROMPTS <= 0:
-        raise ValueError("TD_MAX_INFLIGHT_PROMPTS must be positive")
-
-    return ChunkManagerConfig(
-        address=values["TD_CHUNK_MANAGER_ADDRESS"],
-        job_id=values["TD_JOB_ID"],
-        rank_id=values["TD_RANK_ID"],
-        chain_id=chain_id,
-        rpc_timeout_seconds=CHUNK_MANAGER_RPC_TIMEOUT_SECONDS,
-    )
-
-
 def supervise_worker_task(task: asyncio.Task[None], runtime: DriverRuntime) -> None:
     """Convert unexpected background task exits into process failure."""
     if task.cancelled():
@@ -341,131 +279,7 @@ async def drain_worker(
     await asyncio.gather(chunk_writer_task, return_exceptions=True)
 
 
-async def main() -> int:
-    """Run the batch driver event loop until shutdown is requested."""
-    try:
-        config = load_chunk_manager_config()
-    except ValueError as exc:
-        LOGGER.error("Invalid batch driver configuration: %s", exc)
-        return int(DriverRuntime.ReturnCode.GENERIC_ERROR)
-
-    runtime = DriverRuntime(shutdown_event=asyncio.Event(), abort_event=asyncio.Event())
-    loop = asyncio.get_running_loop()
-    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1)
-
-    # SIGTERM / SIGINT attempt to drain; SIGUSR1 aborts because vLLM is already down.
-    for signum in signals:
-        loop.add_signal_handler(signum, runtime.request_shutdown, signum)
-
-    LOGGER.info(
-        "Batch driver started for job=%s rank=%s chain=%s",
-        config.job_id,
-        config.rank_id,
-        config.chain_id,
-    )
-
-    chunk_sem = asyncio.BoundedSemaphore(NUM_LOCAL_CHUNK)
-    input_chunk_queue: asyncio.Queue[InputChunk] = asyncio.Queue(maxsize=NUM_LOCAL_CHUNK)
-    output_chunk_queue: asyncio.Queue[OutputChunk] = asyncio.Queue(maxsize=NUM_LOCAL_CHUNK * 3)
-    intake_done_event = asyncio.Event()
-    lease_tasks: set[asyncio.Task[None]] = set()
-    metrics_app, metrics = create_metrics_app()
-    metrics_server, metrics_server_task = start_metrics_server(metrics_app)
-    channel = grpc.aio.insecure_channel(
-        config.address,
-        options=(("grpc.enable_retries", 0),),
-    )
-    stub = chunk_manager_pb2_grpc.WorkerServiceStub(channel)
-    chain = config.chain_identity()
-
-    chunk_puller_task = asyncio.create_task(
-        chunk_puller(
-            chunk_sem,
-            input_chunk_queue,
-            output_chunk_queue,
-            runtime,
-            intake_done_event,
-            metrics,
-            stub,
-            chain,
-            config.rpc_timeout_seconds,
-            lease_tasks,
-        ),
-        name="chunk-puller",
-    )
-    prompt_driver_task = asyncio.create_task(
-        prompt_driver(
-            chunk_sem,
-            input_chunk_queue,
-            output_chunk_queue,
-            intake_done_event,
-            runtime,
-            metrics,
-        ),
-        name="prompt-driver",
-    )
-    chunk_writer_task = asyncio.create_task(
-        chunk_writer(output_chunk_queue, metrics, chain),
-        name="chunk-writer",
-    )
-    tasks = [chunk_puller_task, prompt_driver_task, chunk_writer_task]
-    for task in tasks:
-        task.add_done_callback(lambda done: supervise_worker_task(done, runtime))
-
-    try:
-        await runtime.shutdown_event.wait()
-
-        if runtime.should_drain_on_shutdown:
-            LOGGER.info("Shutdown requested; draining locally claimed work")
-            drain_task = asyncio.create_task(
-                drain_worker(
-                    chunk_puller_task,
-                    prompt_driver_task,
-                    chunk_writer_task,
-                    input_chunk_queue,
-                    output_chunk_queue,
-                    lease_tasks,
-                ),
-                name="worker-drain",
-            )
-            abort_wait_task = asyncio.create_task(runtime.abort_event.wait(), name="abort-wait")
-            done, _ = await asyncio.wait(
-                {drain_task, abort_wait_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            if drain_task in done:
-                abort_wait_task.cancel()
-                await asyncio.gather(abort_wait_task, return_exceptions=True)
-                try:
-                    await drain_task
-                except Exception:
-                    LOGGER.exception("Failed while draining locally claimed work")
-                    runtime.request_shutdown(
-                        return_code=int(DriverRuntime.ReturnCode.GENERIC_ERROR),
-                        drain=False,
-                    )
-            else:
-                drain_task.cancel()
-                await asyncio.gather(drain_task, return_exceptions=True)
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        for task in tuple(lease_tasks):
-            task.cancel()
-
-        await asyncio.gather(*tasks, *tuple(lease_tasks), return_exceptions=True)
-        await channel.close()
-        await stop_metrics_server(metrics_server, metrics_server_task)
-        for signum in signals:
-            loop.remove_signal_handler(signum)
-
-    LOGGER.info("Batch driver shutting down with return code %s", runtime.return_code)
-    return runtime.return_code
-
-
-def create_metrics_app() -> tuple[FastAPI, DriverMetrics]:
+def create_metrics_app(config: MetricsConfig) -> tuple[FastAPI, DriverMetrics]:
     """Create the FastAPI app exposing driver metrics in Prometheus format."""
     registry = CollectorRegistry()
 
@@ -501,7 +315,7 @@ def create_metrics_app() -> tuple[FastAPI, DriverMetrics]:
     )
 
     app = FastAPI()
-    metrics_path = f"/{METRICS_PATH.strip('/')}" if METRICS_PATH.strip("/") else "/metrics"
+    metrics_path = f"/{config.path.strip('/')}" if config.path.strip("/") else "/metrics"
 
     @app.get(metrics_path, include_in_schema=False)
     async def metrics_endpoint() -> Response:
@@ -510,22 +324,25 @@ def create_metrics_app() -> tuple[FastAPI, DriverMetrics]:
     return app, metrics
 
 
-def start_metrics_server(app: FastAPI) -> tuple[uvicorn.Server, asyncio.Task[None]]:
+def start_metrics_server(
+    app: FastAPI,
+    config: MetricsConfig,
+) -> tuple[uvicorn.Server, asyncio.Task[None]]:
     """Start the metrics ASGI server in the current event loop."""
-    config = uvicorn.Config(
+    server_config = uvicorn.Config(
         app,
-        host=METRICS_HOST,
-        port=METRICS_PORT,
+        host=config.host,
+        port=config.port,
         log_level="warning",
         access_log=False,
     )
-    server = uvicorn.Server(config)
+    server = uvicorn.Server(server_config)
     task = asyncio.create_task(server.serve(), name="metrics-server")
     LOGGER.info(
         "Batched metrics endpoint listening on http://%s:%s%s",
-        METRICS_HOST,
-        METRICS_PORT,
-        METRICS_PATH,
+        config.host,
+        config.port,
+        config.path,
     )
     return server, task
 
@@ -904,7 +721,7 @@ async def chunk_puller(
     metrics: DriverMetrics,
     stub: chunk_manager_pb2_grpc.WorkerServiceStub,
     chain: chunk_manager_pb2.ChainIdentity,
-    rpc_timeout_seconds: float,
+    config: ChunkManagerConfig,
     lease_tasks: set[asyncio.Task[None]],
 ) -> None:
     """Claim chunks up to the local chunk limit without busy waiting."""
@@ -918,7 +735,7 @@ async def chunk_puller(
                 break
 
             try:
-                claim = await claim_chunk(stub, chain, rpc_timeout_seconds)
+                claim = await claim_chunk(stub, chain, config.rpc_timeout_seconds)
             except grpc.RpcError as exc:
                 chunk_sem.release()
                 if (
@@ -939,7 +756,7 @@ async def chunk_puller(
                 )
                 await wait_for_shutdown_or_timeout(
                     shutdown_event,
-                    NO_CHUNK_BACKOFF_SECONDS,
+                    config.no_chunk_backoff_seconds,
                 )
                 continue
             except Exception:
@@ -960,7 +777,7 @@ async def chunk_puller(
                 chunk_sem.release()
                 await wait_for_shutdown_or_timeout(
                     shutdown_event,
-                    NO_CHUNK_BACKOFF_SECONDS,
+                    config.no_chunk_backoff_seconds,
                 )
                 continue
 
@@ -968,7 +785,7 @@ async def chunk_puller(
                 stub,
                 chain,
                 lease,
-                rpc_timeout_seconds,
+                config.rpc_timeout_seconds,
                 lease_tasks,
                 runtime,
             )
@@ -1055,16 +872,17 @@ async def prompt_driver(
     intake_done_event: asyncio.Event,
     runtime: DriverRuntime,
     metrics: DriverMetrics,
+    config: BatchWorkerConfig,
 ) -> None:
     """Submit chunk prompts to vLLM and enqueue completed chunks for writing."""
     current_chunk: ActiveChunk | None = None
     inflight: set[asyncio.Task[PromptResult]] = set()
     vllm_ready = False
 
-    async with httpx.AsyncClient(timeout=VLLM_REQUEST_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=config.vllm_request_timeout_seconds) as client:
         try:
             while True:
-                while len(inflight) < MAX_INFLIGHT_PROMPTS:
+                while len(inflight) < config.max_inflight_prompts:
                     if current_chunk is None:
                         if not inflight:
                             input_chunk = await get_next_input_chunk(
@@ -1085,7 +903,7 @@ async def prompt_driver(
                             continue
 
                         if not vllm_ready:
-                            readiness_code = await wait_for_vllm_ready(runtime)
+                            readiness_code = await wait_for_vllm_ready(runtime, config)
                             if readiness_code != 0:
                                 input_chunk_queue.task_done()
                                 chunk_sem.release()
@@ -1128,7 +946,7 @@ async def prompt_driver(
                     current_chunk.next_prompt_index += 1
 
                     prompt_task = asyncio.create_task(
-                        submit_prompt(client, current_chunk, prompt_index, prompt),
+                        submit_prompt(client, current_chunk, prompt_index, prompt, config),
                         name=(
                             f"prompt-{current_chunk.chunk_id}-"
                             f"{current_chunk.lease.generation}-{prompt_index}"
@@ -1203,12 +1021,15 @@ async def submit_prompt(
     chunk: ActiveChunk,
     prompt_index: int,
     prompt: str,
+    config: BatchWorkerConfig,
 ) -> PromptResult:
     """Cancel a vLLM request promptly if its lease becomes stale."""
     if chunk.lease.stale_event.is_set():
         return PromptResult(chunk=chunk, prompt_index=prompt_index, output=None)
 
-    request_task = asyncio.create_task(submit_prompt_request(client, chunk, prompt_index, prompt))
+    request_task = asyncio.create_task(
+        submit_prompt_request(client, chunk, prompt_index, prompt, config)
+    )
     stale_task = asyncio.create_task(chunk.lease.stale_event.wait())
     child_tasks = {request_task, stale_task}
     try:
@@ -1231,6 +1052,7 @@ async def submit_prompt_request(
     chunk: ActiveChunk,
     prompt_index: int,
     prompt: str,
+    config: BatchWorkerConfig,
 ) -> PromptResult:
     """Submit one Batch JSONL request to vLLM and preserve its chunk location."""
     request = json.loads(prompt)
@@ -1257,10 +1079,12 @@ async def submit_prompt_request(
     error_payload: object | None
 
     try:
-        response = await client.post(f"{VLLM_BASE_URL.rstrip('/')}{url}", json=body)
+        response = await client.post(f"{config.vllm_base_url.rstrip('/')}{url}", json=body)
         response.raise_for_status()
     except httpx.TimeoutException as exc:
-        message = str(exc) or f"Request timed out after {VLLM_REQUEST_TIMEOUT_SECONDS:g} seconds"
+        message = (
+            str(exc) or f"Request timed out after {config.vllm_request_timeout_seconds:g} seconds"
+        )
         response_payload = None
         error_payload = {
             "type": exc.__class__.__name__,
@@ -1293,15 +1117,15 @@ async def submit_prompt_request(
     )
 
 
-async def wait_for_vllm_ready(runtime: DriverRuntime) -> int:
+async def wait_for_vllm_ready(runtime: DriverRuntime, config: BatchWorkerConfig) -> int:
     """Wait until the local vLLM OpenAI server is accepting requests."""
     shutdown_event = runtime.shutdown_event
-    deadline = time.monotonic() + VLLM_READY_TIMEOUT_SECONDS
-    health_url = f"{VLLM_BASE_URL.rstrip('/')}/health"
+    deadline = time.monotonic() + config.vllm_ready_timeout_seconds
+    health_url = f"{config.vllm_base_url.rstrip('/')}/health"
 
     LOGGER.info("Waiting for vLLM readiness at %s", health_url)
 
-    async with httpx.AsyncClient(timeout=VLLM_HEALTH_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=config.vllm_health_timeout_seconds) as client:
         # Even if shutdown_event is set, keep waiting for vLLM if graceful drain.
         while not shutdown_event.is_set() or runtime.should_drain_on_shutdown:
             if time.monotonic() >= deadline:
@@ -1322,12 +1146,12 @@ async def wait_for_vllm_ready(runtime: DriverRuntime) -> int:
 
             # If graceful drain, can't wait on shutdown_event anymore
             if runtime.should_drain_on_shutdown:
-                await asyncio.sleep(VLLM_READY_INTERVAL_SECONDS)
+                await asyncio.sleep(config.vllm_ready_interval_seconds)
             else:
                 with suppress(TimeoutError):
                     await asyncio.wait_for(
                         shutdown_event.wait(),
-                        timeout=VLLM_READY_INTERVAL_SECONDS,
+                        timeout=config.vllm_ready_interval_seconds,
                     )
 
     return 2
@@ -1344,6 +1168,8 @@ async def chunk_writer(
 
         try:
             lease = completed_chunk.lease
+
+            # Skip this chunk completion if the lease is invalid
             if lease.stale_event.is_set():
                 continue
 
@@ -1502,6 +1328,129 @@ async def put_chunk(completed_chunk: OutputChunk, job_id: str) -> OutputArtifact
     )
 
 
+async def main(config: BatchDriverConfig) -> int:
+    """Run the batch driver event loop until shutdown is requested."""
+    runtime = DriverRuntime(shutdown_event=asyncio.Event(), abort_event=asyncio.Event())
+    loop = asyncio.get_running_loop()
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1)
+
+    # SIGTERM / SIGINT attempt to drain; SIGUSR1 aborts because vLLM is already down.
+    for signum in signals:
+        loop.add_signal_handler(signum, runtime.request_shutdown, signum)
+
+    LOGGER.info(
+        "Batch driver started for job=%s rank=%s chain=%s",
+        config.chunk_manager.job_id,
+        config.chunk_manager.rank_id,
+        config.chunk_manager.chain_id,
+    )
+
+    chunk_sem = asyncio.BoundedSemaphore(config.worker.num_local_chunks)
+    input_chunk_queue: asyncio.Queue[InputChunk] = asyncio.Queue(
+        maxsize=config.worker.num_local_chunks
+    )
+    output_chunk_queue: asyncio.Queue[OutputChunk] = asyncio.Queue(
+        maxsize=config.worker.num_local_chunks * 3
+    )
+    intake_done_event = asyncio.Event()
+    lease_tasks: set[asyncio.Task[None]] = set()
+    metrics_app, metrics = create_metrics_app(config.metrics)
+    metrics_server, metrics_server_task = start_metrics_server(metrics_app, config.metrics)
+    channel = grpc.aio.insecure_channel(
+        config.chunk_manager.address,
+        options=(("grpc.enable_retries", 0),),
+    )
+    stub = chunk_manager_pb2_grpc.WorkerServiceStub(channel)
+    chain = config.chunk_manager.chain_identity()
+
+    chunk_puller_task = asyncio.create_task(
+        chunk_puller(
+            chunk_sem,
+            input_chunk_queue,
+            output_chunk_queue,
+            runtime,
+            intake_done_event,
+            metrics,
+            stub,
+            chain,
+            config.chunk_manager,
+            lease_tasks,
+        ),
+        name="chunk-puller",
+    )
+    prompt_driver_task = asyncio.create_task(
+        prompt_driver(
+            chunk_sem,
+            input_chunk_queue,
+            output_chunk_queue,
+            intake_done_event,
+            runtime,
+            metrics,
+            config.worker,
+        ),
+        name="prompt-driver",
+    )
+    chunk_writer_task = asyncio.create_task(
+        chunk_writer(output_chunk_queue, metrics, chain),
+        name="chunk-writer",
+    )
+    tasks = [chunk_puller_task, prompt_driver_task, chunk_writer_task]
+    for task in tasks:
+        task.add_done_callback(lambda done: supervise_worker_task(done, runtime))
+
+    try:
+        await runtime.shutdown_event.wait()
+
+        if runtime.should_drain_on_shutdown:
+            LOGGER.info("Shutdown requested; draining locally claimed work")
+            drain_task = asyncio.create_task(
+                drain_worker(
+                    chunk_puller_task,
+                    prompt_driver_task,
+                    chunk_writer_task,
+                    input_chunk_queue,
+                    output_chunk_queue,
+                    lease_tasks,
+                ),
+                name="worker-drain",
+            )
+            abort_wait_task = asyncio.create_task(runtime.abort_event.wait(), name="abort-wait")
+            done, _ = await asyncio.wait(
+                {drain_task, abort_wait_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if drain_task in done:
+                abort_wait_task.cancel()
+                await asyncio.gather(abort_wait_task, return_exceptions=True)
+                try:
+                    await drain_task
+                except Exception:
+                    LOGGER.exception("Failed while draining locally claimed work")
+                    runtime.request_shutdown(
+                        return_code=int(DriverRuntime.ReturnCode.GENERIC_ERROR),
+                        drain=False,
+                    )
+            else:
+                drain_task.cancel()
+                await asyncio.gather(drain_task, return_exceptions=True)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tuple(lease_tasks):
+            task.cancel()
+
+        await asyncio.gather(*tasks, *tuple(lease_tasks), return_exceptions=True)
+        await channel.close()
+        await stop_metrics_server(metrics_server, metrics_server_task)
+        for signum in signals:
+            loop.remove_signal_handler(signum)
+
+    LOGGER.info("Batch driver shutting down with return code %s", runtime.return_code)
+    return runtime.return_code
+
+
 if __name__ == "__main__":
     # Initialize logger
     level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -1514,4 +1463,10 @@ if __name__ == "__main__":
         force=True,
     )
 
-    raise SystemExit(asyncio.run(main()))
+    try:
+        driver_config = load_batch_driver_config()
+    except ValueError as exc:
+        LOGGER.error("Invalid batch driver configuration: %s", exc)
+        raise SystemExit(int(DriverRuntime.ReturnCode.GENERIC_ERROR)) from None
+
+    raise SystemExit(asyncio.run(main(driver_config)))

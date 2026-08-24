@@ -16,6 +16,12 @@ from google.rpc.status_pb2 import Status
 
 from tandemn.chunkmanager.v1 import chunk_manager_pb2, chunk_manager_pb2_grpc
 from tandemn_worker import batch_driver
+from tandemn_worker.config import (
+    BatchWorkerConfig,
+    ChunkManagerConfig,
+    MetricsConfig,
+    load_batch_driver_config,
+)
 
 
 class FakeRpcError(grpc.RpcError):
@@ -109,6 +115,44 @@ def chain_identity() -> chunk_manager_pb2.ChainIdentity:
     )
 
 
+def chunk_manager_config() -> ChunkManagerConfig:
+    return ChunkManagerConfig(
+        address="chunk-manager:50051",
+        job_id="01K2H7M9NWV2Q8JGRF3B5TC6DX",
+        rank_id="01K2H7M9NWV2Q8JGRF3B5TC6DY",
+        chain_id=2,
+        rpc_timeout_seconds=1.0,
+        no_chunk_backoff_seconds=1.0,
+    )
+
+
+def metrics_config() -> MetricsConfig:
+    return MetricsConfig(host="127.0.0.1", port=9000, path="/metrics")
+
+
+def worker_config() -> BatchWorkerConfig:
+    return BatchWorkerConfig(
+        num_local_chunks=1,
+        vllm_base_url="http://127.0.0.1:8000",
+        vllm_ready_timeout_seconds=600.0,
+        vllm_ready_interval_seconds=3.0,
+        vllm_health_timeout_seconds=1.0,
+        vllm_request_timeout_seconds=120.0,
+        max_inflight_prompts=1,
+    )
+
+
+def config_environment(**overrides: str) -> dict[str, str]:
+    environ = {
+        "TD_CHUNK_MANAGER_ADDRESS": "chunk-manager:50051",
+        "TD_JOB_ID": "job-1",
+        "TD_RANK_ID": "rank-1",
+        "TD_CHAIN_ID": "2",
+    }
+    environ.update(overrides)
+    return environ
+
+
 def lease_state(
     input_ref: str = "/tmp/input.jsonl",
     *,
@@ -133,6 +177,123 @@ def rich_rpc_error(code: grpc.StatusCode, reason: str) -> FakeRpcError:
         details,
         (("grpc-status-details-bin", status.SerializeToString()),),
     )
+
+
+def test_load_batch_driver_config_uses_defaults() -> None:
+    config = load_batch_driver_config(
+        {
+            "TD_CHUNK_MANAGER_ADDRESS": " chunk-manager:50051 ",
+            "TD_JOB_ID": " job-1 ",
+            "TD_RANK_ID": " rank-1 ",
+            "TD_CHAIN_ID": " 2 ",
+        }
+    )
+
+    assert config.chunk_manager == ChunkManagerConfig(
+        address="chunk-manager:50051",
+        job_id="job-1",
+        rank_id="rank-1",
+        chain_id=2,
+        rpc_timeout_seconds=5.0,
+        no_chunk_backoff_seconds=1.0,
+    )
+    assert config.metrics == MetricsConfig(
+        host="0.0.0.0",
+        port=9000,
+        path="/metrics",
+    )
+    assert config.worker == BatchWorkerConfig(
+        num_local_chunks=5,
+        vllm_base_url="http://127.0.0.1:8000",
+        vllm_ready_timeout_seconds=600.0,
+        vllm_ready_interval_seconds=3.0,
+        vllm_health_timeout_seconds=1.0,
+        vllm_request_timeout_seconds=120.0,
+        max_inflight_prompts=100,
+    )
+
+
+def test_load_batch_driver_config_uses_overrides_and_vllm_port_fallback() -> None:
+    environ = config_environment(
+        TD_CHUNK_MANAGER_RPC_TIMEOUT_SECONDS="7.5",
+        TD_NO_CHUNK_BACKOFF_SECONDS="2.5",
+        TD_NUM_LOCAL_CHUNK="8",
+        TD_VLLM_PORT="8123",
+        TD_VLLM_READY_TIMEOUT_SECONDS="30",
+        TD_VLLM_READY_INTERVAL_SECONDS="0.5",
+        TD_VLLM_HEALTH_TIMEOUT_SECONDS="2",
+        TD_VLLM_REQUEST_TIMEOUT_SECONDS="240",
+        TD_MAX_INFLIGHT_PROMPTS="16",
+        TD_METRICS_HOST="127.0.0.1",
+        TD_METRICS_PORT="9100",
+        TD_METRICS_PATH="/internal/metrics",
+    )
+
+    config = load_batch_driver_config(environ)
+
+    assert config.chunk_manager.rpc_timeout_seconds == 7.5
+    assert config.chunk_manager.no_chunk_backoff_seconds == 2.5
+    assert config.worker == BatchWorkerConfig(
+        num_local_chunks=8,
+        vllm_base_url="http://127.0.0.1:8123",
+        vllm_ready_timeout_seconds=30.0,
+        vllm_ready_interval_seconds=0.5,
+        vllm_health_timeout_seconds=2.0,
+        vllm_request_timeout_seconds=240.0,
+        max_inflight_prompts=16,
+    )
+    assert config.metrics == MetricsConfig(
+        host="127.0.0.1",
+        port=9100,
+        path="/internal/metrics",
+    )
+
+    environ["TD_VLLM_BASE_URL"] = "http://vllm.example:9001/"
+    config = load_batch_driver_config(environ)
+    assert config.worker.vllm_base_url == "http://vllm.example:9001/"
+
+
+def test_load_batch_driver_config_reports_all_missing_required_values() -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Missing required environment variables: TD_CHUNK_MANAGER_ADDRESS, "
+            "TD_JOB_ID, TD_RANK_ID, TD_CHAIN_ID"
+        ),
+    ):
+        load_batch_driver_config({})
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("TD_CHAIN_ID", "invalid", "TD_CHAIN_ID must be an integer"),
+        ("TD_CHUNK_MANAGER_RPC_TIMEOUT_SECONDS", "invalid", "must be a number"),
+        ("TD_NO_CHUNK_BACKOFF_SECONDS", "invalid", "must be a number"),
+        ("TD_NUM_LOCAL_CHUNK", "invalid", "must be an integer"),
+        ("TD_MAX_INFLIGHT_PROMPTS", "invalid", "must be an integer"),
+        ("TD_METRICS_PORT", "invalid", "must be an integer"),
+        ("TD_VLLM_READY_TIMEOUT_SECONDS", "invalid", "must be a number"),
+        ("TD_VLLM_READY_INTERVAL_SECONDS", "invalid", "must be a number"),
+        ("TD_VLLM_HEALTH_TIMEOUT_SECONDS", "invalid", "must be a number"),
+        ("TD_VLLM_REQUEST_TIMEOUT_SECONDS", "invalid", "must be a number"),
+        ("TD_CHAIN_ID", "-1", "TD_CHAIN_ID must be non-negative"),
+        ("TD_CHUNK_MANAGER_RPC_TIMEOUT_SECONDS", "0", "must be positive"),
+        ("TD_NO_CHUNK_BACKOFF_SECONDS", "0", "must be positive"),
+        ("TD_NUM_LOCAL_CHUNK", "0", "must be positive"),
+        ("TD_MAX_INFLIGHT_PROMPTS", "0", "must be positive"),
+    ],
+)
+def test_load_batch_driver_config_rejects_invalid_values(
+    name: str,
+    value: str,
+    message: str,
+) -> None:
+    environ = config_environment()
+    environ[name] = value
+
+    with pytest.raises(ValueError, match=message):
+        load_batch_driver_config(environ)
 
 
 @pytest.mark.asyncio
@@ -391,7 +552,7 @@ async def test_chain_not_active_stops_claiming_and_drains() -> None:
     output_queue: asyncio.Queue[batch_driver.OutputChunk] = asyncio.Queue(maxsize=1)
     runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
     intake_done = asyncio.Event()
-    _, metrics = batch_driver.create_metrics_app()
+    _, metrics = batch_driver.create_metrics_app(metrics_config())
 
     await batch_driver.chunk_puller(
         chunk_sem,
@@ -402,7 +563,7 @@ async def test_chain_not_active_stops_claiming_and_drains() -> None:
         metrics,
         worker_stub(fake),
         chain_identity(),
-        1.0,
+        chunk_manager_config(),
         set(),
     )
 
@@ -447,7 +608,7 @@ async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Pa
     runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
     intake_done = asyncio.Event()
     lease_tasks: set[asyncio.Task[None]] = set()
-    _, metrics = batch_driver.create_metrics_app()
+    _, metrics = batch_driver.create_metrics_app(metrics_config())
     writer = asyncio.create_task(batch_driver.chunk_writer(output_queue, metrics, chain))
 
     try:
@@ -460,7 +621,7 @@ async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Pa
             metrics,
             worker_stub(fake),
             chain,
-            1.0,
+            chunk_manager_config(),
             lease_tasks,
         )
         await asyncio.wait_for(output_queue.join(), timeout=1)
@@ -489,7 +650,7 @@ async def test_terminal_job_discards_local_work_without_drain() -> None:
     chunk_sem = asyncio.BoundedSemaphore(1)
     runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
     intake_done = asyncio.Event()
-    _, metrics = batch_driver.create_metrics_app()
+    _, metrics = batch_driver.create_metrics_app(metrics_config())
 
     await batch_driver.chunk_puller(
         chunk_sem,
@@ -500,7 +661,7 @@ async def test_terminal_job_discards_local_work_without_drain() -> None:
         metrics,
         worker_stub(fake),
         chain_identity(),
-        1.0,
+        chunk_manager_config(),
         set(),
     )
 
@@ -598,7 +759,7 @@ async def test_stale_queued_chunk_skips_vllm_and_releases_capacity(tmp_path: Pat
     intake_done = asyncio.Event()
     intake_done.set()
     runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
-    _, metrics = batch_driver.create_metrics_app()
+    _, metrics = batch_driver.create_metrics_app(metrics_config())
 
     await batch_driver.prompt_driver(
         chunk_sem,
@@ -607,6 +768,7 @@ async def test_stale_queued_chunk_skips_vllm_and_releases_capacity(tmp_path: Pat
         intake_done,
         runtime,
         metrics,
+        worker_config(),
     )
 
     await asyncio.wait_for(input_queue.join(), timeout=0.1)
