@@ -12,48 +12,51 @@ import signal
 import sys
 import tempfile
 import time
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
 import grpc
 import httpx
-import uvicorn
-from fastapi import FastAPI, Response
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.rpc.error_details_pb2 import ErrorInfo
 from grpc_status import rpc_status
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
-    CollectorRegistry,
-    Counter,
-    Gauge,
-    generate_latest,
-)
 
 from tandemn.chunkmanager.v1 import chunk_manager_pb2, chunk_manager_pb2_grpc
 from tandemn_worker.config import (
     BatchDriverConfig,
     BatchWorkerConfig,
     ChunkManagerConfig,
-    MetricsConfig,
     load_batch_driver_config,
+)
+from tandemn_worker.metrics import (
+    DriverMetrics,
+    create_metrics_app,
+    start_metrics_server,
+    stop_metrics_server,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 RPC_RETRY_INITIAL_SECONDS = 0.25
 RPC_RETRY_MAX_SECONDS = 5.0
-LEASE_RENEWAL_FRACTION = 0.5
+LEASE_RENEWAL_FRACTION = 0.5  # How much time used in lease before renewing
 MIN_COMPLETION_RPC_SECONDS = 0.001
 CHAIN_NOT_ACTIVE_REASON = "CHAIN_NOT_ACTIVE"
 LEASE_EXPIRED_REASON = "LEASE_EXPIRED"
 STALE_COMPLETION_REASONS = frozenset({"INVALID_STATE", "STALE_LEASE"})
 
 
+########## Program lifecycle related classes and functions ##########
+
+
+# Program is in 3 states: Running, Draining, Abort
+# Running -> Draining -> Abort
+# Running -> Abort
 @dataclass(slots=True)
 class DriverRuntime:
     """Shared process-level shutdown state."""
@@ -64,48 +67,113 @@ class DriverRuntime:
         SUCCESS = 0
         GENERIC_ERROR = 1
         VLLM_READY_TIMEOUT = 10
+        CHAIN_NOT_ACTIVE = 11
 
-    # shutdown_event signals that shutdown should occur, and is registered as signal handler
-    # + called as a failure mode in some places
-    # abort_event can further interrupt that to force shutdown, only read in main()
-    # E.g. While doing graceful shutdown, the process gets stuck, this Event prevents it
-    # from blocking forever. main() in a graceful shutdown waits on abort_event and will wake
-    shutdown_event: asyncio.Event
-    abort_event: asyncio.Event
+    shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
+    abort_event: asyncio.Event = field(default_factory=asyncio.Event)
     return_code: int = int(ReturnCode.SUCCESS)
-    should_drain_on_shutdown: bool = False
 
-    def request_shutdown(
-        self,
-        signum: int | None = None,
-        return_code: int | None = None,
-        drain: bool | None = None,
-    ) -> None:
-        """Request driver shutdown and track whether locally claimed work drains."""
-        signal_number = None if signum is None else int(signum)
+    @property
+    def is_draining(self) -> bool:
+        """Return whether shutdown is preserving already claimed work."""
+        return self.shutdown_event.is_set() and not self.abort_event.is_set()
 
-        # If not explicitly specified, drain only if SIGINT/SIGTERM
-        should_drain = (
-            signal_number in {int(signal.SIGINT), int(signal.SIGTERM)} if drain is None else drain
-        )
+    def request_drain(self, return_code: int) -> None:
+        """Begin shutdown while allowing already claimed work to complete."""
 
-        if return_code is None:
-            return_code = (
-                128 + signal_number if signal_number is not None else int(self.ReturnCode.SUCCESS)
-            )
-
+        # Continuous call to this function is no-op (Draining -> Draining)
         if self.shutdown_event.is_set():
-            if not should_drain and self.should_drain_on_shutdown:
-                self.return_code = return_code
-                self.should_drain_on_shutdown = False
-                self.abort_event.set()
             return
 
         self.return_code = return_code
-        self.should_drain_on_shutdown = should_drain
         self.shutdown_event.set()
-        if not should_drain:
-            self.abort_event.set()
+
+    def request_abort(self, return_code: int) -> None:
+        """Begin or escalate shutdown without waiting for claimed work."""
+
+        # Continuous call to this function is no-op (Abort -> Abort)
+        if self.abort_event.is_set():
+            return
+
+        self.return_code = return_code
+        self.abort_event.set()
+        self.shutdown_event.set()
+
+    def handle_signal(self, signum: int) -> None:
+        """Translate a process signal into a drain or abort request."""
+        signal_number = int(signum)
+        return_code = 128 + signal_number
+
+        # Drain only if SIGINT/SIGTERM, abort otherwise
+        if signal_number in {int(signal.SIGINT), int(signal.SIGTERM)}:
+            self.request_drain(return_code)
+        else:
+            self.request_abort(return_code)
+
+
+# Shared infra to wrap all tasks, 2 main kinds of tasks are wrapped
+# Core worker tasks, allow_early_exit = False
+# lease lifecycle tasks, allow_early_exit = True
+async def run_supervised(
+    name: str,
+    operation: Callable[[], Awaitable[None]],
+    runtime: DriverRuntime,
+    *,
+    allow_early_exit: bool = False,  # Means "Can this task exit before proc shutdown"
+) -> None:
+    """Convert one task's failure or unexpected exit into a driver abort."""
+    try:
+        await operation()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOGGER.exception("Background task %s failed", name)
+        runtime.request_abort(int(DriverRuntime.ReturnCode.GENERIC_ERROR))
+    else:  # Success case
+        # allow_early_exit = True for lease lifecycle tasks.
+        # allow_early_exit = False for core tasks, will trigger abort request
+        if not allow_early_exit and not runtime.shutdown_event.is_set():
+            LOGGER.error("Background task %s exited unexpectedly", name)
+            runtime.request_abort(int(DriverRuntime.ReturnCode.GENERIC_ERROR))
+
+
+async def drain_worker(
+    chunk_puller_task: asyncio.Task[None],
+    prompt_driver_task: asyncio.Task[None],
+    output_chunk_queue: asyncio.Queue[OutputChunk],
+    lease_tasks: set[asyncio.Task[None]],
+) -> None:
+    """Drain all locally claimed chunks while their leases remain active."""
+    await chunk_puller_task
+    await prompt_driver_task
+    await output_chunk_queue.join()
+    await asyncio.gather(*tuple(lease_tasks))
+
+
+async def drain_until_aborted(
+    drain: Coroutine[Any, Any, None],
+    abort_event: asyncio.Event,
+) -> None:
+    """Wait for a graceful drain while allowing immediate escalation."""
+    drain_task: asyncio.Task[None] = asyncio.create_task(drain, name="worker-drain")
+    abort_task = asyncio.create_task(abort_event.wait(), name="abort-wait")
+    helper_tasks = (drain_task, abort_task)
+    try:
+        done, _ = await asyncio.wait(
+            helper_tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if abort_task in done:
+            return
+        await drain_task
+    finally:  # All cases jump to here, which is a last guarantee
+        for task in helper_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*helper_tasks, return_exceptions=True)
+
+
+########## Core workers related ##########
 
 
 @dataclass(slots=True)
@@ -223,148 +291,11 @@ class PromptResult:
     output: str | None
 
 
-@dataclass(slots=True)
-class DriverMetrics:
-    """Prometheus metrics updated by the batch driver."""
-
-    # Updated in 2 places in prompt_driver. When it finishes pumping reqs, and before processing done reqs
-    inflight_requests: Gauge
-    requests_processed: Counter
-    input_chunks_pulled: Counter
-    output_chunks_written: Counter
-
-
-def supervise_worker_task(task: asyncio.Task[None], runtime: DriverRuntime) -> None:
-    """Convert unexpected background task exits into process failure."""
-    if task.cancelled():
-        return
-
-    exception = task.exception()
-    if exception is not None:
-        LOGGER.error(
-            "Background task %s failed",
-            task.get_name(),
-            exc_info=(type(exception), exception, exception.__traceback__),
-        )
-        runtime.request_shutdown(
-            return_code=int(DriverRuntime.ReturnCode.GENERIC_ERROR),
-            drain=False,
-        )
-    elif not runtime.shutdown_event.is_set():
-        LOGGER.error("Background task %s exited unexpectedly", task.get_name())
-        runtime.request_shutdown(
-            return_code=int(DriverRuntime.ReturnCode.GENERIC_ERROR),
-            drain=False,
-        )
-
-
-async def drain_worker(
-    chunk_puller_task: asyncio.Task[None],
-    prompt_driver_task: asyncio.Task[None],
-    chunk_writer_task: asyncio.Task[None],
-    input_chunk_queue: asyncio.Queue[InputChunk],
-    output_chunk_queue: asyncio.Queue[OutputChunk],
-    lease_tasks: set[asyncio.Task[None]],
-) -> None:
-    """Drain all locally claimed chunks while their leases remain active."""
-    await chunk_puller_task
-    await prompt_driver_task
-    await input_chunk_queue.join()
-    await output_chunk_queue.join()
-
-    while lease_tasks:
-        await asyncio.gather(*tuple(lease_tasks))
-
-    chunk_writer_task.cancel()
-    await asyncio.gather(chunk_writer_task, return_exceptions=True)
-
-
-def create_metrics_app(config: MetricsConfig) -> tuple[FastAPI, DriverMetrics]:
-    """Create the FastAPI app exposing driver metrics in Prometheus format."""
-    registry = CollectorRegistry()
-
-    inflight_requests = Gauge(
-        "batched_reqs_inflight",
-        "Number of prompt requests currently in flight.",
-        registry=registry,
-    )
-
-    requests_processed = Counter(
-        "batched_reqs_processed",
-        "Total number of prompt requests that have received a response.",
-        registry=registry,
-    )
-
-    input_chunks_pulled = Counter(
-        "batched_chunks_input_pulled",
-        "Total number of input chunks pulled.",
-        registry=registry,
-    )
-
-    output_chunks_written = Counter(
-        "batched_chunks_output_written",
-        "Total number of output chunks written.",
-        registry=registry,
-    )
-
-    metrics = DriverMetrics(
-        inflight_requests=inflight_requests,
-        requests_processed=requests_processed,
-        input_chunks_pulled=input_chunks_pulled,
-        output_chunks_written=output_chunks_written,
-    )
-
-    app = FastAPI()
-    metrics_path = f"/{config.path.strip('/')}" if config.path.strip("/") else "/metrics"
-
-    @app.get(metrics_path, include_in_schema=False)
-    async def metrics_endpoint() -> Response:
-        return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
-
-    return app, metrics
-
-
-def start_metrics_server(
-    app: FastAPI,
-    config: MetricsConfig,
-) -> tuple[uvicorn.Server, asyncio.Task[None]]:
-    """Start the metrics ASGI server in the current event loop."""
-    server_config = uvicorn.Config(
-        app,
-        host=config.host,
-        port=config.port,
-        log_level="warning",
-        access_log=False,
-    )
-    server = uvicorn.Server(server_config)
-    task = asyncio.create_task(server.serve(), name="metrics-server")
-    LOGGER.info(
-        "Batched metrics endpoint listening on http://%s:%s%s",
-        config.host,
-        config.port,
-        config.path,
-    )
-    return server, task
-
-
-async def stop_metrics_server(server: uvicorn.Server, task: asyncio.Task[None]) -> None:
-    """Request a graceful metrics server shutdown."""
-    server.should_exit = True
-    await asyncio.gather(task, return_exceptions=True)
-
-
 TRANSIENT_RPC_CODES = frozenset(
     {
         grpc.StatusCode.ABORTED,
         grpc.StatusCode.DEADLINE_EXCEEDED,
         grpc.StatusCode.UNAVAILABLE,
-    }
-)
-TERMINAL_JOB_STATES = frozenset(
-    {
-        chunk_manager_pb2.JOB_STATE_SUCCEEDED,
-        chunk_manager_pb2.JOB_STATE_FAILED,
-        chunk_manager_pb2.JOB_STATE_CANCELLED,
     }
 )
 
@@ -389,11 +320,6 @@ def next_renewal_at(
 def jittered_delay(delay_seconds: float) -> float:
     """Apply small jitter so many workers do not retry in lockstep."""
     return random.uniform(delay_seconds * 0.8, delay_seconds * 1.2)
-
-
-def is_transient_rpc_error(error: grpc.RpcError) -> bool:
-    """Return whether an RPC can safely be attempted again by the caller."""
-    return error.code() in TRANSIENT_RPC_CODES
 
 
 def rpc_error_reason(error: grpc.RpcError) -> str | None:
@@ -427,24 +353,10 @@ async def claim_chunk(
         timeout=rpc_timeout_seconds,
     )
 
-    if response.job_state in TERMINAL_JOB_STATES:
-        if response.leases:
-            raise RuntimeError("Chunk manager returned leases for a terminal job")
-        return ClaimResult(job_state=int(response.job_state))
-
-    if response.job_state != chunk_manager_pb2.JOB_STATE_RUNNING:
-        raise RuntimeError(f"Chunk manager returned unexpected job state {response.job_state}")
-    if len(response.leases) > 1:
-        raise RuntimeError("Chunk manager returned more leases than requested")
-    if not response.leases:
+    if response.job_state != chunk_manager_pb2.JOB_STATE_RUNNING or not response.leases:
         return ClaimResult(job_state=int(response.job_state))
 
     claimed = response.leases[0]
-    if claimed.generation <= 0:
-        raise RuntimeError("Chunk manager returned a non-positive lease generation")
-    if not claimed.input_ref.strip():
-        raise RuntimeError("Chunk manager returned an empty input reference")
-
     lease = LeaseState(
         chunk_id=claimed.chunk_id,
         generation=claimed.generation,
@@ -488,7 +400,7 @@ async def renew_lease(
                     exc.details(),
                 )
                 return False
-            if not is_transient_rpc_error(exc):
+            if exc.code() not in TRANSIENT_RPC_CODES:
                 raise
 
             LOGGER.warning(
@@ -576,7 +488,7 @@ async def complete_chunk(
                 lease.generation,
             )
         except grpc.RpcError as exc:
-            if is_transient_rpc_error(exc):
+            if exc.code() in TRANSIENT_RPC_CODES:
                 outcome_uncertain = True
                 LOGGER.warning(
                     "Completion RPC failed for chunk=%s generation=%s; retrying: %s",
@@ -677,31 +589,19 @@ def start_lease_lifecycle(
     runtime: DriverRuntime,
 ) -> None:
     """Start and supervise coordination for a newly claimed lease."""
+    task_name = f"lease-{lease.chunk_id}-{lease.generation}"
     task = asyncio.create_task(
-        lease_lifecycle(stub, chain, lease, rpc_timeout_seconds),
-        name=f"lease-{lease.chunk_id}-{lease.generation}",
+        run_supervised(
+            task_name,
+            lambda: lease_lifecycle(stub, chain, lease, rpc_timeout_seconds),
+            runtime,
+            allow_early_exit=True,
+        ),
+        name=task_name,
     )
     lease.lifecycle_task = task
     lease_tasks.add(task)
-
-    def lease_done(done: asyncio.Task[None]) -> None:
-        lease_tasks.discard(done)
-        if done.cancelled():
-            return
-        exception = done.exception()
-        if exception is not None:
-            LOGGER.error(
-                "Lease lifecycle failed for chunk=%s generation=%s",
-                lease.chunk_id,
-                lease.generation,
-                exc_info=(type(exception), exception, exception.__traceback__),
-            )
-            runtime.request_shutdown(
-                return_code=int(DriverRuntime.ReturnCode.GENERIC_ERROR),
-                drain=False,
-            )
-
-    task.add_done_callback(lease_done)
+    task.add_done_callback(lease_tasks.discard)
 
 
 async def cancel_lease_lifecycle(lease: LeaseState) -> None:
@@ -743,12 +643,9 @@ async def chunk_puller(
                     and rpc_error_reason(exc) == CHAIN_NOT_ACTIVE_REASON
                 ):
                     LOGGER.info("Chain is draining; stopping intake and completing local leases")
-                    runtime.request_shutdown(
-                        return_code=int(DriverRuntime.ReturnCode.SUCCESS),
-                        drain=True,
-                    )
+                    runtime.request_drain(int(DriverRuntime.ReturnCode.CHAIN_NOT_ACTIVE))
                     return
-                if not is_transient_rpc_error(exc):
+                if exc.code() not in TRANSIENT_RPC_CODES:
                     raise
                 LOGGER.warning(
                     "Claim RPC failed with an uncertain outcome; any unseen lease will expire: %s",
@@ -763,16 +660,15 @@ async def chunk_puller(
                 chunk_sem.release()
                 raise
 
-            if claim.job_state in TERMINAL_JOB_STATES:
+            # Immediately abort since job is fully completed
+            if claim.job_state != chunk_manager_pb2.JOB_STATE_RUNNING:
                 chunk_sem.release()
                 LOGGER.info("Chunk manager reported terminal job state %s", claim.job_state)
-                runtime.request_shutdown(
-                    return_code=int(DriverRuntime.ReturnCode.SUCCESS),
-                    drain=False,
-                )
+                runtime.request_abort(int(DriverRuntime.ReturnCode.SUCCESS))
                 return
 
             lease = claim.lease
+            # No lease but job is not complete, so wait and retry
             if lease is None:
                 chunk_sem.release()
                 await wait_for_shutdown_or_timeout(
@@ -781,6 +677,7 @@ async def chunk_puller(
                 )
                 continue
 
+            # Actually got a lease!
             start_lease_lifecycle(
                 stub,
                 chain,
@@ -884,6 +781,11 @@ async def prompt_driver(
             while True:
                 while len(inflight) < config.max_inflight_prompts:
                     if current_chunk is None:
+                        # Okay this section is convoluted but hold my beer
+                        # Can afford to block getting an input chunk if there
+                        # are no inflight request that might need processing
+                        # However, it needs to be wakeable in case a shutdown signal
+                        # comes. Therefore, you see what you see here.
                         if not inflight:
                             input_chunk = await get_next_input_chunk(
                                 input_chunk_queue,
@@ -911,11 +813,8 @@ async def prompt_driver(
                                     LOGGER.error(
                                         "Prompt driver stopping because vLLM readiness timed out"
                                     )
-                                    runtime.request_shutdown(
-                                        return_code=int(
-                                            DriverRuntime.ReturnCode.VLLM_READY_TIMEOUT
-                                        ),
-                                        drain=False,
+                                    runtime.request_abort(
+                                        int(DriverRuntime.ReturnCode.VLLM_READY_TIMEOUT)
                                     )
                                 else:
                                     LOGGER.info(
@@ -967,23 +866,15 @@ async def prompt_driver(
                         return
                     continue
 
-                done, pending = await asyncio.wait(
+                done, _ = await asyncio.wait(
                     inflight,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                inflight = pending
-                metrics.inflight_requests.set(len(inflight))
+                metrics.inflight_requests.set(len(inflight) - len(done))
 
                 for task in done:
-                    try:
-                        result = task.result()
-                    except Exception:
-                        LOGGER.exception("Prompt request failed; stopping batch driver")
-                        runtime.request_shutdown(
-                            return_code=int(DriverRuntime.ReturnCode.GENERIC_ERROR),
-                            drain=False,
-                        )
-                        return
+                    result = task.result()
+                    inflight.remove(task)
 
                     chunk = result.chunk
                     if chunk.finalized:
@@ -1030,6 +921,9 @@ async def submit_prompt(
     request_task = asyncio.create_task(
         submit_prompt_request(client, chunk, prompt_index, prompt, config)
     )
+
+    # Similar pattern of process prompt but break if stale_event is set,
+    # which means the lease expired and processing the curr chunk is useless
     stale_task = asyncio.create_task(chunk.lease.stale_event.wait())
     child_tasks = {request_task, stale_task}
     try:
@@ -1127,7 +1021,7 @@ async def wait_for_vllm_ready(runtime: DriverRuntime, config: BatchWorkerConfig)
 
     async with httpx.AsyncClient(timeout=config.vllm_health_timeout_seconds) as client:
         # Even if shutdown_event is set, keep waiting for vLLM if graceful drain.
-        while not shutdown_event.is_set() or runtime.should_drain_on_shutdown:
+        while not shutdown_event.is_set() or runtime.is_draining:
             if time.monotonic() >= deadline:
                 return 1
 
@@ -1145,7 +1039,7 @@ async def wait_for_vllm_ready(runtime: DriverRuntime, config: BatchWorkerConfig)
                 )
 
             # If graceful drain, can't wait on shutdown_event anymore
-            if runtime.should_drain_on_shutdown:
+            if runtime.is_draining:
                 await asyncio.sleep(config.vllm_ready_interval_seconds)
             else:
                 with suppress(TimeoutError):
@@ -1330,13 +1224,15 @@ async def put_chunk(completed_chunk: OutputChunk, job_id: str) -> OutputArtifact
 
 async def main(config: BatchDriverConfig) -> int:
     """Run the batch driver event loop until shutdown is requested."""
-    runtime = DriverRuntime(shutdown_event=asyncio.Event(), abort_event=asyncio.Event())
+    runtime = DriverRuntime()
     loop = asyncio.get_running_loop()
     signals = (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1)
 
+    ##### Housekeeping / Setup #####
+
     # SIGTERM / SIGINT attempt to drain; SIGUSR1 aborts because vLLM is already down.
     for signum in signals:
-        loop.add_signal_handler(signum, runtime.request_shutdown, signum)
+        loop.add_signal_handler(signum, runtime.handle_signal, signum)
 
     LOGGER.info(
         "Batch driver started for job=%s rank=%s chain=%s",
@@ -1344,6 +1240,11 @@ async def main(config: BatchDriverConfig) -> int:
         config.chunk_manager.rank_id,
         config.chunk_manager.chain_id,
     )
+
+    metrics_app, metrics = create_metrics_app(config.metrics)
+    metrics_server, metrics_server_task = start_metrics_server(metrics_app, config.metrics)
+
+    ##### Variables for main workers #####
 
     chunk_sem = asyncio.BoundedSemaphore(config.worker.num_local_chunks)
     input_chunk_queue: asyncio.Queue[InputChunk] = asyncio.Queue(
@@ -1354,8 +1255,6 @@ async def main(config: BatchDriverConfig) -> int:
     )
     intake_done_event = asyncio.Event()
     lease_tasks: set[asyncio.Task[None]] = set()
-    metrics_app, metrics = create_metrics_app(config.metrics)
-    metrics_server, metrics_server_task = start_metrics_server(metrics_app, config.metrics)
     channel = grpc.aio.insecure_channel(
         config.chunk_manager.address,
         options=(("grpc.enable_retries", 0),),
@@ -1363,85 +1262,78 @@ async def main(config: BatchDriverConfig) -> int:
     stub = chunk_manager_pb2_grpc.WorkerServiceStub(channel)
     chain = config.chunk_manager.chain_identity()
 
+    ##### Spawn main worker tasks #####
+
     chunk_puller_task = asyncio.create_task(
-        chunk_puller(
-            chunk_sem,
-            input_chunk_queue,
-            output_chunk_queue,
+        run_supervised(
+            "chunk-puller",
+            lambda: chunk_puller(
+                chunk_sem,
+                input_chunk_queue,
+                output_chunk_queue,
+                runtime,
+                intake_done_event,
+                metrics,
+                stub,
+                chain,
+                config.chunk_manager,
+                lease_tasks,
+            ),
             runtime,
-            intake_done_event,
-            metrics,
-            stub,
-            chain,
-            config.chunk_manager,
-            lease_tasks,
         ),
         name="chunk-puller",
     )
     prompt_driver_task = asyncio.create_task(
-        prompt_driver(
-            chunk_sem,
-            input_chunk_queue,
-            output_chunk_queue,
-            intake_done_event,
+        run_supervised(
+            "prompt-driver",
+            lambda: prompt_driver(
+                chunk_sem,
+                input_chunk_queue,
+                output_chunk_queue,
+                intake_done_event,
+                runtime,
+                metrics,
+                config.worker,
+            ),
             runtime,
-            metrics,
-            config.worker,
         ),
         name="prompt-driver",
     )
     chunk_writer_task = asyncio.create_task(
-        chunk_writer(output_chunk_queue, metrics, chain),
+        run_supervised(
+            "chunk-writer",
+            lambda: chunk_writer(output_chunk_queue, metrics, chain),
+            runtime,
+        ),
         name="chunk-writer",
     )
     tasks = [chunk_puller_task, prompt_driver_task, chunk_writer_task]
-    for task in tasks:
-        task.add_done_callback(lambda done: supervise_worker_task(done, runtime))
 
     try:
         await runtime.shutdown_event.wait()
 
-        if runtime.should_drain_on_shutdown:
+        if runtime.is_draining:
             LOGGER.info("Shutdown requested; draining locally claimed work")
-            drain_task = asyncio.create_task(
-                drain_worker(
-                    chunk_puller_task,
-                    prompt_driver_task,
-                    chunk_writer_task,
-                    input_chunk_queue,
-                    output_chunk_queue,
-                    lease_tasks,
-                ),
-                name="worker-drain",
-            )
-            abort_wait_task = asyncio.create_task(runtime.abort_event.wait(), name="abort-wait")
-            done, _ = await asyncio.wait(
-                {drain_task, abort_wait_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            if drain_task in done:
-                abort_wait_task.cancel()
-                await asyncio.gather(abort_wait_task, return_exceptions=True)
-                try:
-                    await drain_task
-                except Exception:
-                    LOGGER.exception("Failed while draining locally claimed work")
-                    runtime.request_shutdown(
-                        return_code=int(DriverRuntime.ReturnCode.GENERIC_ERROR),
-                        drain=False,
-                    )
-            else:
-                drain_task.cancel()
-                await asyncio.gather(drain_task, return_exceptions=True)
+            try:
+                await drain_until_aborted(
+                    drain_worker(
+                        chunk_puller_task,
+                        prompt_driver_task,
+                        output_chunk_queue,
+                        lease_tasks,
+                    ),
+                    runtime.abort_event,
+                )
+            except Exception:
+                LOGGER.exception("Failed while draining locally claimed work")
+                runtime.request_abort(int(DriverRuntime.ReturnCode.GENERIC_ERROR))
     finally:
-        for task in tasks:
+        tasks_to_stop = (*tasks, *tuple(lease_tasks))
+        for task in tasks_to_stop:
             if not task.done():
                 task.cancel()
-        for task in tuple(lease_tasks):
-            task.cancel()
 
-        await asyncio.gather(*tasks, *tuple(lease_tasks), return_exceptions=True)
+        await asyncio.gather(*tasks_to_stop, return_exceptions=True)
         await channel.close()
         await stop_metrics_server(metrics_server, metrics_server_task)
         for signum in signals:

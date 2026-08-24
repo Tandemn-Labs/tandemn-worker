@@ -22,6 +22,7 @@ from tandemn_worker.config import (
     MetricsConfig,
     load_batch_driver_config,
 )
+from tandemn_worker.metrics import create_metrics_app
 
 
 class FakeRpcError(grpc.RpcError):
@@ -330,6 +331,19 @@ async def test_claim_chunk_preserves_lease_and_uses_server_clock(
 
 
 @pytest.mark.asyncio
+async def test_claim_chunk_returns_no_lease_when_running_has_no_work() -> None:
+    response = chunk_manager_pb2.ClaimChunksResponse(
+        job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
+    )
+    fake = FakeWorkerStub(claims=[response])
+
+    result = await batch_driver.claim_chunk(worker_stub(fake), chain_identity(), 4.0)
+
+    assert result.job_state == chunk_manager_pb2.JOB_STATE_RUNNING
+    assert result.lease is None
+
+
+@pytest.mark.asyncio
 async def test_generated_client_works_with_async_grpc_transport() -> None:
     requests: list[chunk_manager_pb2.ClaimChunksRequest] = []
 
@@ -359,6 +373,7 @@ async def test_generated_client_works_with_async_grpc_transport() -> None:
         await server.stop(None)
 
     assert result.job_state == chunk_manager_pb2.JOB_STATE_SUCCEEDED
+    assert result.lease is None
     assert len(requests) == 1
     assert requests[0].max_chunks == 1
 
@@ -552,7 +567,7 @@ async def test_chain_not_active_stops_claiming_and_drains() -> None:
     output_queue: asyncio.Queue[batch_driver.OutputChunk] = asyncio.Queue(maxsize=1)
     runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
     intake_done = asyncio.Event()
-    _, metrics = batch_driver.create_metrics_app(metrics_config())
+    _, metrics = create_metrics_app(metrics_config())
 
     await batch_driver.chunk_puller(
         chunk_sem,
@@ -568,8 +583,9 @@ async def test_chain_not_active_stops_claiming_and_drains() -> None:
     )
 
     assert runtime.shutdown_event.is_set()
-    assert runtime.should_drain_on_shutdown
+    assert runtime.is_draining
     assert not runtime.abort_event.is_set()
+    assert runtime.return_code == int(batch_driver.DriverRuntime.ReturnCode.CHAIN_NOT_ACTIVE)
     assert intake_done.is_set()
     await asyncio.wait_for(chunk_sem.acquire(), timeout=0.1)
 
@@ -608,7 +624,7 @@ async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Pa
     runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
     intake_done = asyncio.Event()
     lease_tasks: set[asyncio.Task[None]] = set()
-    _, metrics = batch_driver.create_metrics_app(metrics_config())
+    _, metrics = create_metrics_app(metrics_config())
     writer = asyncio.create_task(batch_driver.chunk_writer(output_queue, metrics, chain))
 
     try:
@@ -631,7 +647,8 @@ async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Pa
         writer.cancel()
         await asyncio.gather(writer, return_exceptions=True)
 
-    assert runtime.should_drain_on_shutdown
+    assert runtime.is_draining
+    assert runtime.return_code == int(batch_driver.DriverRuntime.ReturnCode.CHAIN_NOT_ACTIVE)
     assert intake_done.is_set()
     assert len(fake.completion_requests) == 1
     assert fake.completion_requests[0].lease.chunk_id == 7
@@ -639,18 +656,26 @@ async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_terminal_job_discards_local_work_without_drain() -> None:
+@pytest.mark.parametrize(
+    "job_state",
+    [
+        chunk_manager_pb2.JOB_STATE_SUCCEEDED,
+        chunk_manager_pb2.JOB_STATE_FAILED,
+        chunk_manager_pb2.JOB_STATE_CANCELLED,
+    ],
+)
+async def test_terminal_job_discards_local_work_without_drain(job_state: int) -> None:
     fake = FakeWorkerStub(
         claims=[
             chunk_manager_pb2.ClaimChunksResponse(
-                job_state=chunk_manager_pb2.JOB_STATE_CANCELLED,
+                job_state=job_state,
             )
         ]
     )
     chunk_sem = asyncio.BoundedSemaphore(1)
     runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
     intake_done = asyncio.Event()
-    _, metrics = batch_driver.create_metrics_app(metrics_config())
+    _, metrics = create_metrics_app(metrics_config())
 
     await batch_driver.chunk_puller(
         chunk_sem,
@@ -666,22 +691,174 @@ async def test_terminal_job_discards_local_work_without_drain() -> None:
     )
 
     assert runtime.shutdown_event.is_set()
-    assert not runtime.should_drain_on_shutdown
+    assert not runtime.is_draining
     assert runtime.abort_event.is_set()
     assert runtime.return_code == 0
 
 
 @pytest.mark.asyncio
 async def test_immediate_shutdown_escalates_an_existing_drain() -> None:
-    runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
+    runtime = batch_driver.DriverRuntime()
 
-    runtime.request_shutdown(signum=signal.SIGTERM)
-    runtime.request_shutdown(signum=signal.SIGUSR1)
+    runtime.handle_signal(signal.SIGTERM)
+    runtime.handle_signal(signal.SIGUSR1)
 
     assert runtime.shutdown_event.is_set()
     assert runtime.abort_event.is_set()
-    assert not runtime.should_drain_on_shutdown
+    assert not runtime.is_draining
     assert runtime.return_code == 128 + signal.SIGUSR1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_state_transitions_are_monotonic() -> None:
+    runtime = batch_driver.DriverRuntime()
+
+    assert not runtime.shutdown_event.is_set()
+    assert not runtime.abort_event.is_set()
+    assert not runtime.is_draining
+
+    runtime.request_drain(20)
+
+    assert runtime.shutdown_event.is_set()
+    assert not runtime.abort_event.is_set()
+    assert runtime.is_draining
+    assert runtime.return_code == 20
+
+    runtime.request_drain(21)
+    assert runtime.return_code == 20
+
+    runtime.request_abort(22)
+
+    assert runtime.shutdown_event.is_set()
+    assert runtime.abort_event.is_set()
+    assert not runtime.is_draining
+    assert runtime.return_code == 22
+
+    runtime.request_drain(23)
+    runtime.request_abort(24)
+    assert runtime.return_code == 22
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draining", [False, True])
+async def test_supervised_task_failure_requests_abort(draining: bool) -> None:
+    runtime = batch_driver.DriverRuntime()
+    if draining:
+        runtime.request_drain(20)
+
+    async def fail() -> None:
+        raise RuntimeError("test failure")
+
+    await batch_driver.run_supervised("failing-worker", fail, runtime)
+
+    assert runtime.shutdown_event.is_set()
+    assert runtime.abort_event.is_set()
+    assert runtime.return_code == int(batch_driver.DriverRuntime.ReturnCode.GENERIC_ERROR)
+
+
+@pytest.mark.asyncio
+async def test_supervised_task_rejects_unexpected_early_exit() -> None:
+    runtime = batch_driver.DriverRuntime()
+
+    async def finish() -> None:
+        return
+
+    await batch_driver.run_supervised("worker", finish, runtime)
+
+    assert runtime.shutdown_event.is_set()
+    assert runtime.abort_event.is_set()
+    assert runtime.return_code == int(batch_driver.DriverRuntime.ReturnCode.GENERIC_ERROR)
+
+
+@pytest.mark.asyncio
+async def test_supervised_task_allows_expected_early_exit() -> None:
+    runtime = batch_driver.DriverRuntime()
+
+    async def finish() -> None:
+        return
+
+    await batch_driver.run_supervised(
+        "lease",
+        finish,
+        runtime,
+        allow_early_exit=True,
+    )
+
+    assert not runtime.shutdown_event.is_set()
+    assert not runtime.abort_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_abort_interrupts_an_active_drain() -> None:
+    runtime = batch_driver.DriverRuntime()
+    drain_started = asyncio.Event()
+    drain_cancelled = asyncio.Event()
+
+    async def blocked_drain() -> None:
+        drain_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            drain_cancelled.set()
+
+    runtime.request_drain(0)
+    task = asyncio.create_task(
+        batch_driver.drain_until_aborted(blocked_drain(), runtime.abort_event)
+    )
+    await drain_started.wait()
+
+    runtime.request_abort(1)
+    await asyncio.wait_for(task, timeout=0.1)
+
+    assert drain_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_output_and_lease_tasks() -> None:
+    async def finish() -> None:
+        return
+
+    lease_finished = asyncio.Event()
+
+    async def finish_lease() -> None:
+        await lease_finished.wait()
+
+    chunk_puller = asyncio.create_task(finish())
+    prompt_driver = asyncio.create_task(finish())
+    lease_task = asyncio.create_task(finish_lease())
+    output_queue: asyncio.Queue[batch_driver.OutputChunk] = asyncio.Queue()
+    await output_queue.put(batch_driver.OutputChunk(lease=lease_state()))
+    drain_task = asyncio.create_task(
+        batch_driver.drain_worker(
+            chunk_puller,
+            prompt_driver,
+            output_queue,
+            {lease_task},
+        )
+    )
+
+    try:
+        await asyncio.sleep(0)
+        assert not drain_task.done()
+
+        output_queue.task_done()
+        await asyncio.sleep(0)
+        assert not drain_task.done()
+
+        lease_finished.set()
+        await asyncio.wait_for(drain_task, timeout=0.1)
+    finally:
+        lease_finished.set()
+        for task in (chunk_puller, prompt_driver, lease_task, drain_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            chunk_puller,
+            prompt_driver,
+            lease_task,
+            drain_task,
+            return_exceptions=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -759,7 +936,7 @@ async def test_stale_queued_chunk_skips_vllm_and_releases_capacity(tmp_path: Pat
     intake_done = asyncio.Event()
     intake_done.set()
     runtime = batch_driver.DriverRuntime(asyncio.Event(), asyncio.Event())
-    _, metrics = batch_driver.create_metrics_app(metrics_config())
+    _, metrics = create_metrics_app(metrics_config())
 
     await batch_driver.prompt_driver(
         chunk_sem,

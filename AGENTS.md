@@ -13,6 +13,7 @@ Current repo: tandemn-labs/tandemn-worker
 - Simplicity first. No features beyond what was asked. No abstractions for single-use code. No "flexibility" or "configurability" that wasn't requested. No error handling for impossible scenarios. Do not add unnecessary complexity in order to attain goals like scalability and security.
 - Make only surgical changes. Touch only what is needed, don't improve or refractor anything that is not absolutely necessary.
 - Work backwards; Define the GOAL first (success criteria) then ASK QUESTIONS till verified. Your goal is to transform the goal into sub-tasks and verifiable goals. For multi-step tasks, state a brief plan.
+- Don't remove existing explanatory comments unless the changes to the code changed the validity of the comments
 
 ### Python rules
 - Use PEP 8 as code style guide and PEP 257 as docstrings style guide.
