@@ -1353,15 +1353,10 @@ async def put_chunk(completed_chunk: OutputChunk, job_id: str) -> OutputArtifact
     if lease.input_path is None:
         raise RuntimeError(f"Chunk {lease.chunk_id} has no resolved input path")
 
+    # Strip {job_id}/input/{chunk_id}.jsonl to recover the shared storage prefix.
+    storage_prefix = lease.input_path.parents[2]
     output_path = (
-        lease.input_path.parent
-        / "jobs"
-        / job_id
-        / "chunks"
-        / str(lease.chunk_id)
-        / "generations"
-        / str(lease.generation)
-        / "output.jsonl"
+        storage_prefix / job_id / "output" / str(lease.chunk_id) / f"{lease.generation}.jsonl"
     )
     output_text = "\n".join(completed_chunk.outputs)
     if output_text:
@@ -1371,7 +1366,7 @@ async def put_chunk(completed_chunk: OutputChunk, job_id: str) -> OutputArtifact
     try:
         await asyncio.to_thread(
             write_output_immutably,
-            lease.input_path.parent,
+            storage_prefix,
             output_path,
             output_bytes,
         )

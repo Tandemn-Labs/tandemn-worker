@@ -746,7 +746,8 @@ async def test_chain_not_active_stops_claiming_and_drains() -> None:
 
 @pytest.mark.asyncio
 async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Path) -> None:
-    input_path = tmp_path / "empty.jsonl"
+    input_path = tmp_path / chain_identity().job_id / "input" / "7.jsonl"
+    input_path.parent.mkdir(parents=True)
     input_path.write_text("", encoding="utf-8")
     claim = chunk_manager_pb2.ClaimChunksResponse(
         job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
@@ -1017,7 +1018,8 @@ async def test_drain_waits_for_output_and_lease_tasks() -> None:
 
 @pytest.mark.asyncio
 async def test_local_file_adapter_writes_immutable_generation_output(tmp_path: Path) -> None:
-    input_path = tmp_path / "input.jsonl"
+    input_path = tmp_path / chain_identity().job_id / "input" / "7.jsonl"
+    input_path.parent.mkdir(parents=True)
     input_path.write_text("first\nsecond\n", encoding="utf-8")
     lease = lease_state(input_path.as_uri())
 
@@ -1026,16 +1028,7 @@ async def test_local_file_adapter_writes_immutable_generation_output(tmp_path: P
 
     output_chunk = batch_driver.OutputChunk(lease=lease, outputs=["one", "two"])
     artifact = await batch_driver.put_chunk(output_chunk, chain_identity().job_id)
-    output_path = (
-        tmp_path
-        / "jobs"
-        / chain_identity().job_id
-        / "chunks"
-        / "7"
-        / "generations"
-        / "3"
-        / "output.jsonl"
-    )
+    output_path = tmp_path / chain_identity().job_id / "output" / "7" / "3.jsonl"
     expected = b"one\ntwo\n"
 
     assert output_path.read_bytes() == expected
@@ -1371,11 +1364,12 @@ async def test_local_storage_io_errors_are_retriable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    missing_lease = lease_state((tmp_path / "missing.jsonl").as_uri())
+    input_path = tmp_path / chain_identity().job_id / "input" / "7.jsonl"
+    missing_lease = lease_state(input_path.as_uri())
     with pytest.raises(batch_driver.ChunkStorageError, match="FileNotFoundError"):
         await batch_driver.get_chunk(missing_lease)
 
-    input_path = tmp_path / "input.jsonl"
+    input_path.parent.mkdir(parents=True)
     input_path.write_text("prompt\n", encoding="utf-8")
     output_lease = lease_state(input_path.as_uri())
     output_lease.input_path = input_path
