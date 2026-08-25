@@ -23,6 +23,23 @@ Natural termination happens when `batch_driver.py` detects that the job is compl
 
 In K8s, if the pod is terminated, `supervisor.py` receives the SIGTERM and propagates this to both child processes. It generally does not escalate to SIGKILL and leaves that to K8s to force termination. It escalates when it is waiting for a sibling to terminate (and that sibling does not terminate in time), because this case can be self-triggered instead of external triggered by K8s (e.g. job is done, one sibling crashes).
 
+### Prompt processing
+
+`prompt_driver() -> submit_prompt() -> submit_prompt_request()`
+
+#### `prompt_driver()`
+The main task/coroutine that is actually coordinating the work, it pulls out prompts from the active chunk, saturates the vLLM engine and receives output as they come in (out of order).
+
+#### `submit_prompt()`
+Really just a wrapper to check if the lease is stale. It creates 2 tasks - (1) `chunk.lease.state_event.wait()` and (2) `submit_prompt_request()`. (1) waits for the stale `asyncio.Event` to be set, while (2) actually does the HTTP request/response. If stale event happens first, prompt gets cancelled.
+
+#### `submit_prompt_request()`
+Actual HTTP request construction happens here. The returned `PromptResult` has an `output` field which is basically a JSON. This JSON contains a response payload and an error payload. If there is an error (HTTP timeout, HTTP error), it sets response payloade to None and populates the error payload. Vice versa for the successful case. Either case, the payloads are wrapped up in `PromptResult` and returned.
+
+#### Error propagation
+`submit_prompt_request()` catches all exceptions and just fold it into the `PromptResult.output` string, which is basically a JSON dump with the 2 key fields of `response` and `error`.
+
+
 
 ### Metrics
 

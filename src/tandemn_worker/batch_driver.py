@@ -49,6 +49,7 @@ MIN_COMPLETION_RPC_SECONDS = 0.001
 CHAIN_NOT_ACTIVE_REASON = "CHAIN_NOT_ACTIVE"
 LEASE_EXPIRED_REASON = "LEASE_EXPIRED"
 STALE_COMPLETION_REASONS = frozenset({"INVALID_STATE", "STALE_LEASE"})
+STALE_FAILURE_REASONS = frozenset({"INVALID_STATE", "LEASE_EXPIRED", "STALE_LEASE"})
 
 
 ########## Program lifecycle related classes and functions ##########
@@ -185,19 +186,21 @@ class LeaseState:
     input_ref: str
     next_renewal_at: float
     stale_event: asyncio.Event = field(default_factory=asyncio.Event)
-    completion_ready: asyncio.Event = field(default_factory=asyncio.Event)
-    completion_request: chunk_manager_pb2.CompleteChunkRequest | None = None
-    completion_result: asyncio.Future[bool] = field(
+    finalization_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    finalization_request: (
+        chunk_manager_pb2.CompleteChunkRequest | chunk_manager_pb2.FailChunkRequest | None
+    ) = None
+    finalization_result: asyncio.Future[bool] = field(
         default_factory=lambda: asyncio.get_running_loop().create_future()
     )
     input_path: Path | None = None
     lifecycle_task: asyncio.Task[None] | None = None
 
     def __post_init__(self) -> None:
-        self.completion_result.add_done_callback(self._observe_completion_result)
+        self.finalization_result.add_done_callback(self._observe_finalization_result)
 
     @staticmethod
-    def _observe_completion_result(result: asyncio.Future[bool]) -> None:
+    def _observe_finalization_result(result: asyncio.Future[bool]) -> None:
         if not result.cancelled():
             result.exception()
 
@@ -224,6 +227,10 @@ class OutputArtifact:
     uri: str
     checksum: str
     size_bytes: int
+
+
+class ChunkStorageError(Exception):
+    """A storage operation failed and the chunk can be retried."""
 
 
 @dataclass(slots=True)
@@ -375,10 +382,18 @@ async def renew_lease(
     chain: chunk_manager_pb2.ChainIdentity,
     lease: LeaseState,
     rpc_timeout_seconds: float,
-) -> bool:
-    """Renew one lease until its authority is confirmed or definitively lost."""
+    *,
+    stop_for_failure: bool = False,
+) -> bool | None:
+    """Renew a lease, or yield to a pending failure when requested."""
     retry_delay = RPC_RETRY_INITIAL_SECONDS
     while True:
+        if stop_for_failure and isinstance(
+            lease.finalization_request,
+            chunk_manager_pb2.FailChunkRequest,
+        ):
+            return None
+
         call_started_at = time.monotonic()
         try:
             response = await stub.RenewLeases(
@@ -402,6 +417,11 @@ async def renew_lease(
                 return False
             if exc.code() not in TRANSIENT_RPC_CODES:
                 raise
+            if stop_for_failure and isinstance(
+                lease.finalization_request,
+                chunk_manager_pb2.FailChunkRequest,
+            ):
+                return None
 
             LOGGER.warning(
                 "Lease renewal RPC failed for chunk=%s generation=%s; retrying: %s",
@@ -534,49 +554,116 @@ async def complete_chunk(
         )
 
 
+async def fail_chunk(
+    stub: chunk_manager_pb2_grpc.WorkerServiceStub,
+    lease: LeaseState,
+    request: chunk_manager_pb2.FailChunkRequest,
+    rpc_timeout_seconds: float,
+) -> bool:
+    """Report a chunk failure, replaying the request after uncertain outcomes."""
+    retry_delay = RPC_RETRY_INITIAL_SECONDS
+    while True:
+        try:
+            await asyncio.wait_for(
+                stub.FailChunk(request, timeout=rpc_timeout_seconds),
+                timeout=rpc_timeout_seconds,
+            )
+        except TimeoutError:
+            LOGGER.warning(
+                "Failure RPC timed out for chunk=%s generation=%s; retrying",
+                lease.chunk_id,
+                lease.generation,
+            )
+        except grpc.RpcError as exc:
+            if exc.code() in TRANSIENT_RPC_CODES:
+                LOGGER.warning(
+                    "Failure RPC failed for chunk=%s generation=%s; retrying: %s",
+                    lease.chunk_id,
+                    lease.generation,
+                    exc,
+                )
+            elif exc.code() == grpc.StatusCode.NOT_FOUND or (
+                exc.code() == grpc.StatusCode.FAILED_PRECONDITION
+                and rpc_error_reason(exc) in STALE_FAILURE_REASONS
+            ):
+                return False
+            else:
+                raise
+        else:
+            LOGGER.info(
+                "Reported failure for chunk=%s generation=%s retriable=%s",
+                lease.chunk_id,
+                lease.generation,
+                request.retriable,
+            )
+            return True
+
+        await asyncio.sleep(jittered_delay(retry_delay))
+        retry_delay = min(retry_delay * 2, RPC_RETRY_MAX_SECONDS)
+
+
 async def lease_lifecycle(
     stub: chunk_manager_pb2_grpc.WorkerServiceStub,
     chain: chunk_manager_pb2.ChainIdentity,
     lease: LeaseState,
     rpc_timeout_seconds: float,
 ) -> None:
-    """Renew a lease until output is ready, then serialize its completion."""
+    """Renew a lease until its completion or failure is ready to report."""
     try:
         while True:
-            renewal_delay = max(lease.next_renewal_at - time.monotonic(), 0.0)
-            try:
-                await asyncio.wait_for(lease.completion_ready.wait(), timeout=renewal_delay)
-            except TimeoutError:
-                if await renew_lease(stub, chain, lease, rpc_timeout_seconds):
-                    continue
-                lease.stale_event.set()
-                if not lease.completion_result.done():
-                    lease.completion_result.set_result(False)
-                return
+            if not lease.finalization_ready.is_set():
+                renewal_delay = max(lease.next_renewal_at - time.monotonic(), 0.0)
+                try:
+                    await asyncio.wait_for(
+                        lease.finalization_ready.wait(),
+                        timeout=renewal_delay,
+                    )
+                except TimeoutError:
+                    renewed = await renew_lease(
+                        stub,
+                        chain,
+                        lease,
+                        rpc_timeout_seconds,
+                        stop_for_failure=True,
+                    )
+                    if renewed is None or renewed:
+                        continue
+                    lease.stale_event.set()
+                    if not lease.finalization_result.done():
+                        lease.finalization_result.set_result(False)
+                    return
 
-            request = lease.completion_request
+            request = lease.finalization_request
             if request is None:
-                raise RuntimeError("Lease completion was requested without output metadata")
+                raise RuntimeError("Lease finalization was requested without metadata")
 
-            completed = await complete_chunk(
-                stub,
-                chain,
-                lease,
-                request,
-                rpc_timeout_seconds,
-            )
-            if not completed:
+            if isinstance(request, chunk_manager_pb2.CompleteChunkRequest):
+                finalized = await complete_chunk(
+                    stub,
+                    chain,
+                    lease,
+                    request,
+                    rpc_timeout_seconds,
+                )
+            else:
+                finalized = await fail_chunk(
+                    stub,
+                    lease,
+                    request,
+                    rpc_timeout_seconds,
+                )
+            if not finalized:
                 lease.stale_event.set()
-            if not lease.completion_result.done():
-                lease.completion_result.set_result(completed)
+            if not lease.finalization_result.done():
+                lease.finalization_result.set_result(finalized)
             return
     except asyncio.CancelledError:
-        if not lease.completion_result.done():
-            lease.completion_result.cancel()
+        if not lease.finalization_result.done():
+            lease.finalization_result.cancel()
         raise
     except Exception as exc:
-        if not lease.completion_result.done():
-            lease.completion_result.set_exception(exc)
+        if not lease.finalization_result.done():
+            lease.finalization_result.set_exception(exc)
         raise
 
 
@@ -688,6 +775,19 @@ async def chunk_puller(
             )
             try:
                 chunk = await get_chunk(lease)
+            except ChunkStorageError as exc:
+                try:
+                    if not lease.stale_event.is_set():
+                        await mark_chunk_failed(
+                            lease,
+                            chain,
+                            failure_class="STORAGE_READ_ERROR",
+                            message=str(exc),
+                            retriable=True,
+                        )
+                finally:
+                    chunk_sem.release()
+                continue
             except Exception:
                 await cancel_lease_lifecycle(lease)
                 chunk_sem.release()
@@ -931,7 +1031,8 @@ async def submit_prompt(
             child_tasks,
             return_when=asyncio.FIRST_COMPLETED,
         )
-        if stale_task in done and chunk.lease.stale_event.is_set():
+
+        if stale_task in done:
             return PromptResult(chunk=chunk, prompt_index=prompt_index, output=None)
         return request_task.result()
     finally:
@@ -949,55 +1050,68 @@ async def submit_prompt_request(
     config: BatchWorkerConfig,
 ) -> PromptResult:
     """Submit one Batch JSONL request to vLLM and preserve its chunk location."""
-    request = json.loads(prompt)
-    if not isinstance(request, dict):
-        raise RuntimeError("Batch request line is not a JSON object")
-
-    custom_id = request.get("custom_id")
-    if not isinstance(custom_id, str):
-        raise RuntimeError("Batch request does not contain custom_id")
-
-    method = request.get("method")
-    if method != "POST":
-        raise RuntimeError("Batch request method must be POST")
-
-    url = request.get("url")
-    if not isinstance(url, str) or not url.startswith("/v1/"):
-        raise RuntimeError("Batch request url must be a relative /v1/ path")
-
-    body = request.get("body")
-    if not isinstance(body, dict):
-        raise RuntimeError("Batch request body is not a JSON object")
-
-    response_payload: object | None
-    error_payload: object | None
-
+    custom_id: str | None = None
     try:
+        request = json.loads(prompt)
+        if not isinstance(request, dict):
+            raise RuntimeError("Batch request line is not a JSON object")
+
+        custom_id = request.get("custom_id")
+        if not isinstance(custom_id, str):
+            raise RuntimeError("Batch request does not contain custom_id")
+
+        method = request.get("method")
+        if method != "POST":
+            raise RuntimeError("Batch request method must be POST")
+
+        url = request.get("url")
+        if not isinstance(url, str) or not url.startswith("/v1/"):
+            raise RuntimeError("Batch request url must be a relative /v1/ path")
+
+        body = request.get("body")
+        if not isinstance(body, dict):
+            raise RuntimeError("Batch request body is not a JSON object")
+
         response = await client.post(f"{config.vllm_base_url.rstrip('/')}{url}", json=body)
         response.raise_for_status()
-    except httpx.TimeoutException as exc:
-        message = (
-            str(exc) or f"Request timed out after {config.vllm_request_timeout_seconds:g} seconds"
-        )
-        response_payload = None
-        error_payload = {
-            "type": exc.__class__.__name__,
-            "message": message,
-        }
-    except httpx.HTTPError as exc:
-        response_payload = None
-        error_payload = {
-            "type": exc.__class__.__name__,
-            "message": str(exc),
-        }
-    else:
         response_payload = {
             "status_code": response.status_code,
             "request_id": response.headers.get("x-request-id"),
             "body": response.json(),
         }
-        error_payload = None
+        return build_prompt_result(
+            chunk,
+            prompt_index,
+            custom_id,
+            response_payload=response_payload,
+            error_payload=None,
+        )
+    except Exception as exc:
+        message = str(exc)
+        if isinstance(exc, httpx.TimeoutException) and not message:
+            message = f"Request timed out after {config.vllm_request_timeout_seconds:g} seconds"
+        error_payload = {
+            "type": exc.__class__.__name__,
+            "message": message,
+        }
+        return build_prompt_result(
+            chunk,
+            prompt_index,
+            custom_id,
+            response_payload=None,
+            error_payload=error_payload,
+        )
 
+
+def build_prompt_result(
+    chunk: ActiveChunk,
+    prompt_index: int,
+    custom_id: str | None,
+    *,
+    response_payload: object | None,
+    error_payload: object | None,
+) -> PromptResult:
+    """Build one serialized Batch JSONL result."""
     output = {
         "id": f"batch_req_{chunk.chunk_id}_{chunk.lease.generation}_{prompt_index}",
         "custom_id": custom_id,
@@ -1067,7 +1181,18 @@ async def chunk_writer(
             if lease.stale_event.is_set():
                 continue
 
-            artifact = await put_chunk(completed_chunk, chain.job_id)
+            try:
+                artifact = await put_chunk(completed_chunk, chain.job_id)
+            except ChunkStorageError as exc:
+                if not lease.stale_event.is_set():
+                    await mark_chunk_failed(
+                        lease,
+                        chain,
+                        failure_class="STORAGE_WRITE_ERROR",
+                        message=str(exc),
+                        retriable=True,
+                    )
+                continue
             if lease.stale_event.is_set():
                 continue
 
@@ -1084,20 +1209,49 @@ async def mark_chunk_completed(
     chain: chunk_manager_pb2.ChainIdentity,
 ) -> bool:
     """Hand immutable output metadata to the lease lifecycle and await its result."""
-    if lease.completion_request is not None:
-        raise RuntimeError(
-            f"Completion already requested for chunk={lease.chunk_id} generation={lease.generation}"
-        )
-
-    lease.completion_request = chunk_manager_pb2.CompleteChunkRequest(
+    request = chunk_manager_pb2.CompleteChunkRequest(
         chain=chain,
         lease=lease.reference(),
         output_uri=artifact.uri,
         checksum=artifact.checksum,
         output_size_bytes=artifact.size_bytes,
     )
-    lease.completion_ready.set()
-    return await asyncio.shield(lease.completion_result)
+    return await finalize_lease(lease, request)
+
+
+async def mark_chunk_failed(
+    lease: LeaseState,
+    chain: chunk_manager_pb2.ChainIdentity,
+    *,
+    failure_class: str,
+    message: str,
+    retriable: bool,
+) -> bool:
+    """Hand chunk failure metadata to the lease lifecycle and await its result."""
+    request = chunk_manager_pb2.FailChunkRequest(
+        chain=chain,
+        lease=lease.reference(),
+        failure_class=failure_class,
+        message=message,
+        retriable=retriable,
+    )
+    return await finalize_lease(lease, request)
+
+
+async def finalize_lease(
+    lease: LeaseState,
+    request: chunk_manager_pb2.CompleteChunkRequest | chunk_manager_pb2.FailChunkRequest,
+) -> bool:
+    """Submit the single final operation for a lease and await its result."""
+    if lease.finalization_request is not None:
+        raise RuntimeError(
+            f"Lease finalization already requested for chunk={lease.chunk_id} "
+            f"generation={lease.generation}"
+        )
+
+    lease.finalization_request = request
+    lease.finalization_ready.set()
+    return await asyncio.shield(lease.finalization_result)
 
 
 def local_path_from_input_ref(input_ref: str) -> Path:
@@ -1116,9 +1270,14 @@ def local_path_from_input_ref(input_ref: str) -> Path:
 
 async def get_chunk(lease: LeaseState) -> InputChunk:
     """Read a claimed chunk through the temporary local-file storage adapter."""
-    chunk_path = local_path_from_input_ref(lease.input_ref)
-    lease.input_path = chunk_path
-    prompts = await asyncio.to_thread(lambda: chunk_path.read_text(encoding="utf-8").splitlines())
+    try:
+        chunk_path = local_path_from_input_ref(lease.input_ref)
+        lease.input_path = chunk_path
+        prompts = await asyncio.to_thread(
+            lambda: chunk_path.read_text(encoding="utf-8").splitlines()
+        )
+    except OSError as exc:
+        raise ChunkStorageError(f"{exc.__class__.__name__}: {exc}") from exc
     return InputChunk(lease=lease, prompts=prompts)
 
 
@@ -1209,12 +1368,15 @@ async def put_chunk(completed_chunk: OutputChunk, job_id: str) -> OutputArtifact
         output_text += "\n"
     output_bytes = output_text.encode("utf-8")
 
-    await asyncio.to_thread(
-        write_output_immutably,
-        lease.input_path.parent,
-        output_path,
-        output_bytes,
-    )
+    try:
+        await asyncio.to_thread(
+            write_output_immutably,
+            lease.input_path.parent,
+            output_path,
+            output_bytes,
+        )
+    except OSError as exc:
+        raise ChunkStorageError(f"{exc.__class__.__name__}: {exc}") from exc
     return OutputArtifact(
         uri=output_path.as_uri(),
         checksum=f"sha256:{hashlib.sha256(output_bytes).hexdigest()}",

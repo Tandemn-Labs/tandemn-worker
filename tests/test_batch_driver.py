@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import signal
 from collections import deque
 from pathlib import Path
@@ -54,13 +55,16 @@ class FakeWorkerStub:
         claims: list[object] | None = None,
         renewals: list[object] | None = None,
         completions: list[object] | None = None,
+        failures: list[object] | None = None,
     ) -> None:
         self.claims = deque(claims or [])
         self.renewals = deque(renewals or [])
         self.completions = deque(completions or [])
+        self.failures = deque(failures or [])
         self.claim_requests: list[chunk_manager_pb2.ClaimChunksRequest] = []
         self.renewal_requests: list[chunk_manager_pb2.RenewLeasesRequest] = []
         self.completion_requests: list[chunk_manager_pb2.CompleteChunkRequest] = []
+        self.failure_requests: list[chunk_manager_pb2.FailChunkRequest] = []
 
     async def ClaimChunks(  # noqa: N802
         self,
@@ -91,6 +95,16 @@ class FakeWorkerStub:
         del timeout
         self.completion_requests.append(request)
         return cast(chunk_manager_pb2.CompleteChunkResponse, self._resolve(self.completions))
+
+    async def FailChunk(  # noqa: N802
+        self,
+        request: chunk_manager_pb2.FailChunkRequest,
+        *,
+        timeout: float,
+    ) -> chunk_manager_pb2.FailChunkResponse:
+        del timeout
+        self.failure_requests.append(request)
+        return cast(chunk_manager_pb2.FailChunkResponse, self._resolve(self.failures))
 
     @staticmethod
     def _resolve(responses: deque[object]) -> object:
@@ -195,8 +209,8 @@ def test_load_batch_driver_config_uses_defaults() -> None:
         job_id="job-1",
         rank_id="rank-1",
         chain_id=2,
-        rpc_timeout_seconds=5.0,
-        no_chunk_backoff_seconds=1.0,
+        rpc_timeout_seconds=10.0,
+        no_chunk_backoff_seconds=10.0,
     )
     assert config.metrics == MetricsConfig(
         host="0.0.0.0",
@@ -269,15 +283,15 @@ def test_load_batch_driver_config_reports_all_missing_required_values() -> None:
     ("name", "value", "message"),
     [
         ("TD_CHAIN_ID", "invalid", "TD_CHAIN_ID must be an integer"),
-        ("TD_CHUNK_MANAGER_RPC_TIMEOUT_SECONDS", "invalid", "must be a number"),
-        ("TD_NO_CHUNK_BACKOFF_SECONDS", "invalid", "must be a number"),
-        ("TD_NUM_LOCAL_CHUNK", "invalid", "must be an integer"),
-        ("TD_MAX_INFLIGHT_PROMPTS", "invalid", "must be an integer"),
-        ("TD_METRICS_PORT", "invalid", "must be an integer"),
-        ("TD_VLLM_READY_TIMEOUT_SECONDS", "invalid", "must be a number"),
-        ("TD_VLLM_READY_INTERVAL_SECONDS", "invalid", "must be a number"),
-        ("TD_VLLM_HEALTH_TIMEOUT_SECONDS", "invalid", "must be a number"),
-        ("TD_VLLM_REQUEST_TIMEOUT_SECONDS", "invalid", "must be a number"),
+        ("TD_CHUNK_MANAGER_RPC_TIMEOUT_SECONDS", "invalid", "must be a float"),
+        ("TD_NO_CHUNK_BACKOFF_SECONDS", "invalid", "must be a float"),
+        ("TD_NUM_LOCAL_CHUNK", "invalid", "must be an int"),
+        ("TD_MAX_INFLIGHT_PROMPTS", "invalid", "must be an int"),
+        ("TD_METRICS_PORT", "invalid", "must be an int"),
+        ("TD_VLLM_READY_TIMEOUT_SECONDS", "invalid", "must be a float"),
+        ("TD_VLLM_READY_INTERVAL_SECONDS", "invalid", "must be a float"),
+        ("TD_VLLM_HEALTH_TIMEOUT_SECONDS", "invalid", "must be a float"),
+        ("TD_VLLM_REQUEST_TIMEOUT_SECONDS", "invalid", "must be a float"),
         ("TD_CHAIN_ID", "-1", "TD_CHAIN_ID must be non-negative"),
         ("TD_CHUNK_MANAGER_RPC_TIMEOUT_SECONDS", "0", "must be positive"),
         ("TD_NO_CHUNK_BACKOFF_SECONDS", "0", "must be positive"),
@@ -390,7 +404,7 @@ async def test_lease_lifecycle_marks_stale_renewal() -> None:
     await batch_driver.lease_lifecycle(worker_stub(fake), chain_identity(), lease, 1.0)
 
     assert lease.stale_event.is_set()
-    assert lease.completion_result.result() is False
+    assert lease.finalization_result.result() is False
     assert len(fake.renewal_requests) == 1
 
 
@@ -424,6 +438,146 @@ async def test_lease_lifecycle_completes_exact_output_metadata() -> None:
     assert request.output_uri == artifact.uri
     assert request.checksum == artifact.checksum
     assert request.output_size_bytes == artifact.size_bytes
+
+
+@pytest.mark.asyncio
+async def test_lease_lifecycle_reports_exact_retriable_failure() -> None:
+    lease = lease_state()
+    fake = FakeWorkerStub(
+        failures=[
+            chunk_manager_pb2.FailChunkResponse(
+                job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
+            )
+        ]
+    )
+    chain = chain_identity()
+    lifecycle = asyncio.create_task(
+        batch_driver.lease_lifecycle(worker_stub(fake), chain, lease, 1.0)
+    )
+
+    assert await batch_driver.mark_chunk_failed(
+        lease,
+        chain,
+        failure_class="STORAGE_READ_ERROR",
+        message="read failed",
+        retriable=True,
+    )
+    await lifecycle
+
+    assert len(fake.failure_requests) == 1
+    request = fake.failure_requests[0]
+    assert request.chain == chain
+    assert request.lease == lease.reference()
+    assert request.failure_class == "STORAGE_READ_ERROR"
+    assert request.message == "read failed"
+    assert request.retriable
+    assert not fake.renewal_requests
+
+
+@pytest.mark.asyncio
+async def test_failure_request_stops_transient_renewal_retries() -> None:
+    class RenewalThenFailureStub(FakeWorkerStub):
+        def __init__(self) -> None:
+            super().__init__(
+                failures=[
+                    chunk_manager_pb2.FailChunkResponse(
+                        job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
+                    )
+                ]
+            )
+            self.renewal_started = asyncio.Event()
+            self.release_renewal = asyncio.Event()
+
+        async def RenewLeases(  # noqa: N802
+            self,
+            request: chunk_manager_pb2.RenewLeasesRequest,
+            *,
+            timeout: float,
+        ) -> chunk_manager_pb2.RenewLeasesResponse:
+            del timeout
+            self.renewal_requests.append(request)
+            self.renewal_started.set()
+            await self.release_renewal.wait()
+            raise FakeRpcError(grpc.StatusCode.UNAVAILABLE)
+
+    lease = lease_state(next_renewal_at=0)
+    fake = RenewalThenFailureStub()
+    chain = chain_identity()
+    lifecycle = asyncio.create_task(
+        batch_driver.lease_lifecycle(worker_stub(fake), chain, lease, 1.0)
+    )
+    await fake.renewal_started.wait()
+    failure = asyncio.create_task(
+        batch_driver.mark_chunk_failed(
+            lease,
+            chain,
+            failure_class="STORAGE_READ_ERROR",
+            message="read failed",
+            retriable=True,
+        )
+    )
+    await lease.finalization_ready.wait()
+    fake.release_renewal.set()
+
+    assert await failure
+    await lifecycle
+    assert len(fake.renewal_requests) == 1
+    assert len(fake.failure_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_failure_replays_exact_request_after_uncertain_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(batch_driver, "jittered_delay", lambda _delay: 0.0)
+    lease = lease_state()
+    fake = FakeWorkerStub(
+        failures=[
+            FakeRpcError(grpc.StatusCode.UNAVAILABLE),
+            chunk_manager_pb2.FailChunkResponse(
+                job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
+            ),
+        ]
+    )
+    request = chunk_manager_pb2.FailChunkRequest(
+        chain=chain_identity(),
+        lease=lease.reference(),
+        failure_class="STORAGE_WRITE_ERROR",
+        message="write failed",
+        retriable=True,
+    )
+
+    assert await batch_driver.fail_chunk(worker_stub(fake), lease, request, 1.0)
+
+    assert len(fake.failure_requests) == 2
+    assert fake.failure_requests[0] is request
+    assert fake.failure_requests[1] is request
+    assert not fake.renewal_requests
+
+
+@pytest.mark.asyncio
+async def test_failure_replay_treats_stale_lease_as_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(batch_driver, "jittered_delay", lambda _delay: 0.0)
+    lease = lease_state()
+    fake = FakeWorkerStub(
+        failures=[
+            FakeRpcError(grpc.StatusCode.UNAVAILABLE),
+            rich_rpc_error(grpc.StatusCode.FAILED_PRECONDITION, "STALE_LEASE"),
+        ]
+    )
+    request = chunk_manager_pb2.FailChunkRequest(
+        chain=chain_identity(),
+        lease=lease.reference(),
+        failure_class="STORAGE_READ_ERROR",
+        message="read failed",
+        retriable=True,
+    )
+
+    assert not await batch_driver.fail_chunk(worker_stub(fake), lease, request, 1.0)
+    assert len(fake.failure_requests) == 2
+    assert not fake.renewal_requests
 
 
 @pytest.mark.asyncio
@@ -950,3 +1104,288 @@ async def test_stale_queued_chunk_skips_vllm_and_releases_capacity(tmp_path: Pat
 
     await asyncio.wait_for(input_queue.join(), timeout=0.1)
     await asyncio.wait_for(chunk_sem.acquire(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_prompt_errors_do_not_stop_prompt_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+            self.status_code = 200
+            self.headers = {"x-request-id": "request-1"}
+
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> object:
+            if self.mode == "invalid-response":
+                raise ValueError("vLLM returned invalid JSON")
+            if self.mode == "nonserializable-response":
+                return object()
+            return {"ok": True}
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return
+
+        async def post(self, _url: str, *, json: object) -> FakeResponse:
+            assert isinstance(json, dict)
+            if json.get("mode") == "transport-error":
+                raise RuntimeError("transport failed")
+            mode = json.get("mode")
+            assert isinstance(mode, str)
+            return FakeResponse(mode)
+
+    async def ready(_runtime: object, _config: object) -> int:
+        return 0
+
+    monkeypatch.setattr(batch_driver.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+    monkeypatch.setattr(batch_driver, "wait_for_vllm_ready", ready)
+
+    prompts = [
+        json.dumps(
+            {
+                "custom_id": "invalid-response",
+                "method": "POST",
+                "url": "/v1/completions",
+                "body": {"mode": "invalid-response"},
+            }
+        ),
+        json.dumps(
+            {
+                "custom_id": "transport-error",
+                "method": "POST",
+                "url": "/v1/completions",
+                "body": {"mode": "transport-error"},
+            }
+        ),
+        json.dumps(
+            {
+                "custom_id": "success",
+                "method": "POST",
+                "url": "/v1/completions",
+                "body": {"mode": "success"},
+            }
+        ),
+        json.dumps(
+            {
+                "custom_id": "nonserializable-response",
+                "method": "POST",
+                "url": "/v1/completions",
+                "body": {"mode": "nonserializable-response"},
+            }
+        ),
+    ]
+    lease = lease_state()
+    chunk_sem = asyncio.BoundedSemaphore(1)
+    await chunk_sem.acquire()
+    input_queue: asyncio.Queue[batch_driver.InputChunk] = asyncio.Queue(maxsize=1)
+    await input_queue.put(batch_driver.InputChunk(lease=lease, prompts=prompts))
+    output_queue: asyncio.Queue[batch_driver.OutputChunk] = asyncio.Queue(maxsize=1)
+    intake_done = asyncio.Event()
+    intake_done.set()
+    runtime = batch_driver.DriverRuntime()
+    _, metrics = create_metrics_app(metrics_config())
+
+    await batch_driver.prompt_driver(
+        chunk_sem,
+        input_queue,
+        output_queue,
+        intake_done,
+        runtime,
+        metrics,
+        worker_config(),
+    )
+
+    output_chunk = output_queue.get_nowait()
+    output_queue.task_done()
+    outputs = [json.loads(output) for output in output_chunk.outputs]
+    assert outputs[0]["custom_id"] == "invalid-response"
+    assert outputs[0]["response"] is None
+    assert outputs[0]["error"] == {
+        "type": "ValueError",
+        "message": "vLLM returned invalid JSON",
+    }
+    assert outputs[1]["custom_id"] == "transport-error"
+    assert outputs[1]["response"] is None
+    assert outputs[1]["error"] == {
+        "type": "RuntimeError",
+        "message": "transport failed",
+    }
+    assert outputs[2]["custom_id"] == "success"
+    assert outputs[2]["response"]["body"] == {"ok": True}
+    assert outputs[2]["error"] is None
+    assert outputs[3]["custom_id"] == "nonserializable-response"
+    assert outputs[3]["response"] is None
+    assert outputs[3]["error"]["type"] == "TypeError"
+    assert not runtime.shutdown_event.is_set()
+    await asyncio.wait_for(input_queue.join(), timeout=0.1)
+    await asyncio.wait_for(chunk_sem.acquire(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_chunk_read_failure_is_reported_and_intake_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = chunk_manager_pb2.ClaimChunksResponse(
+        job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
+        leases=[
+            chunk_manager_pb2.ChunkLease(
+                chunk_id=7,
+                generation=3,
+                input_ref="file:///missing/input.jsonl",
+                expires_at=timestamp(130),
+            )
+        ],
+        database_time=timestamp(100),
+    )
+    fake = FakeWorkerStub(
+        claims=[
+            claim,
+            chunk_manager_pb2.ClaimChunksResponse(
+                job_state=chunk_manager_pb2.JOB_STATE_SUCCEEDED,
+            ),
+        ],
+        failures=[
+            chunk_manager_pb2.FailChunkResponse(
+                job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
+            )
+        ],
+    )
+
+    async def fail_read(_lease: batch_driver.LeaseState) -> batch_driver.InputChunk:
+        raise batch_driver.ChunkStorageError("FileNotFoundError: missing chunk")
+
+    monkeypatch.setattr(batch_driver, "get_chunk", fail_read)
+    chunk_sem = asyncio.BoundedSemaphore(1)
+    input_queue: asyncio.Queue[batch_driver.InputChunk] = asyncio.Queue(maxsize=1)
+    output_queue: asyncio.Queue[batch_driver.OutputChunk] = asyncio.Queue(maxsize=1)
+    runtime = batch_driver.DriverRuntime()
+    intake_done = asyncio.Event()
+    lease_tasks: set[asyncio.Task[None]] = set()
+    _, metrics = create_metrics_app(metrics_config())
+
+    await batch_driver.chunk_puller(
+        chunk_sem,
+        input_queue,
+        output_queue,
+        runtime,
+        intake_done,
+        metrics,
+        worker_stub(fake),
+        chain_identity(),
+        chunk_manager_config(),
+        lease_tasks,
+    )
+    await asyncio.gather(*tuple(lease_tasks))
+
+    assert len(fake.claim_requests) == 2
+    assert len(fake.failure_requests) == 1
+    request = fake.failure_requests[0]
+    assert request.lease.chunk_id == 7
+    assert request.lease.generation == 3
+    assert request.failure_class == "STORAGE_READ_ERROR"
+    assert request.message == "FileNotFoundError: missing chunk"
+    assert request.retriable
+    assert input_queue.empty()
+    assert output_queue.empty()
+    assert runtime.return_code == 0
+    await asyncio.wait_for(chunk_sem.acquire(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_chunk_write_failure_is_reported_and_writer_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_lease = lease_state()
+    successful_lease = batch_driver.LeaseState(
+        chunk_id=8,
+        generation=4,
+        input_ref="/tmp/input-8.jsonl",
+        next_renewal_at=1_000_000_000.0,
+    )
+    fake = FakeWorkerStub(
+        failures=[
+            chunk_manager_pb2.FailChunkResponse(
+                job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
+            )
+        ],
+        completions=[
+            chunk_manager_pb2.CompleteChunkResponse(
+                job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
+            )
+        ],
+    )
+    chain = chain_identity()
+    failed_lifecycle = asyncio.create_task(
+        batch_driver.lease_lifecycle(worker_stub(fake), chain, failed_lease, 1.0)
+    )
+    successful_lifecycle = asyncio.create_task(
+        batch_driver.lease_lifecycle(worker_stub(fake), chain, successful_lease, 1.0)
+    )
+
+    async def put_chunk(
+        chunk: batch_driver.OutputChunk,
+        _job_id: str,
+    ) -> batch_driver.OutputArtifact:
+        if chunk.chunk_id == failed_lease.chunk_id:
+            raise batch_driver.ChunkStorageError("PermissionError: write failed")
+        return batch_driver.OutputArtifact(
+            uri="file:///tmp/output-8.jsonl",
+            checksum="sha256:abc",
+            size_bytes=12,
+        )
+
+    monkeypatch.setattr(batch_driver, "put_chunk", put_chunk)
+    output_queue: asyncio.Queue[batch_driver.OutputChunk] = asyncio.Queue(maxsize=2)
+    await output_queue.put(batch_driver.OutputChunk(lease=failed_lease, outputs=["failed"]))
+    await output_queue.put(batch_driver.OutputChunk(lease=successful_lease, outputs=["successful"]))
+    _, metrics = create_metrics_app(metrics_config())
+    writer = asyncio.create_task(batch_driver.chunk_writer(output_queue, metrics, chain))
+
+    try:
+        await asyncio.wait_for(output_queue.join(), timeout=1)
+        await asyncio.gather(failed_lifecycle, successful_lifecycle)
+        assert not writer.done()
+    finally:
+        writer.cancel()
+        await asyncio.gather(writer, return_exceptions=True)
+
+    assert len(fake.failure_requests) == 1
+    failure = fake.failure_requests[0]
+    assert failure.lease == failed_lease.reference()
+    assert failure.failure_class == "STORAGE_WRITE_ERROR"
+    assert failure.message == "PermissionError: write failed"
+    assert failure.retriable
+    assert len(fake.completion_requests) == 1
+    assert fake.completion_requests[0].lease == successful_lease.reference()
+
+
+@pytest.mark.asyncio
+async def test_local_storage_io_errors_are_retriable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_lease = lease_state((tmp_path / "missing.jsonl").as_uri())
+    with pytest.raises(batch_driver.ChunkStorageError, match="FileNotFoundError"):
+        await batch_driver.get_chunk(missing_lease)
+
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text("prompt\n", encoding="utf-8")
+    output_lease = lease_state(input_path.as_uri())
+    output_lease.input_path = input_path
+
+    def fail_write(_root: Path, _path: Path, _output: bytes) -> None:
+        raise PermissionError("write denied")
+
+    monkeypatch.setattr(batch_driver, "write_output_immutably", fail_write)
+    with pytest.raises(batch_driver.ChunkStorageError, match="PermissionError: write denied"):
+        await batch_driver.put_chunk(
+            batch_driver.OutputChunk(lease=output_lease, outputs=["output"]),
+            chain_identity().job_id,
+        )
