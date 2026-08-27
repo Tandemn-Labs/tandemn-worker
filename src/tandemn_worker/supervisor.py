@@ -24,12 +24,13 @@ DRIVER_GRACE_TIMEOUT_SECONDS = float(
 # TODO: Figure out env vars for vLLM
 def build_vllm_command() -> list[str]:
     """Build the `vllm serve` command from environment variables."""
+    executable = os.environ.get("TD_VLLM_EXECUTABLE", "vllm")
     model = os.environ.get("TD_VLLM_MODEL", "")
     host = os.environ.get("TD_VLLM_HOST", "0.0.0.0")
     port = os.environ.get("TD_VLLM_PORT", "8000")
     extra_args = shlex.split(os.environ.get("TD_VLLM_EXTRA_ARGS", ""))
 
-    return ["vllm", "serve", model, "--host", host, "--port", port, *extra_args]
+    return [executable, "serve", model, "--host", host, "--port", port, *extra_args]
 
 
 def signal_process(
