@@ -4,6 +4,7 @@ version = "0.0.1"
 description = "The code for the GPU worker containers that will live on the accelerated nodes in Kubernetes."
 requires-python = ">=3.11"
 dependencies = [
+    "boto3>=1.35.2,<2",
     "fastapi",
     "googleapis-common-protos",
     "grpcio>=1.83.0,<2",
@@ -11,6 +12,7 @@ dependencies = [
     "httpx",
     "prometheus-client",
     "protobuf>=7.35.1,<8",
+    "s3transfer>=0.10,<1",
     "uvicorn",
 ]
 
@@ -76,7 +78,11 @@ testpaths = ["tests"]
 
 [[tool.mypy.overrides]]
 module = [
+    "boto3",
+    "boto3.*",
+    "botocore.*",
     "google.rpc.error_details_pb2",
+    "s3transfer.*",
     "tandemn.chunkmanager.v1.chunk_manager_pb2",
     "tandemn.chunkmanager.v1.chunk_manager_pb2_grpc",
 ]

@@ -12,6 +12,14 @@ The number of input chunks that can be held locally is controlled by a semaphore
 
 For now, the limit on output chunks is 3 * limit on input chunks. This can help in setting some backpressure so that we don't have excessive input chunk downloading + processing while the output chunks pile up with slow write to external storage. The backpressure occurs when `prompt_driver` tries to put in another completed output chunk but the output chunk queue is full. However, in general, we want the GPUs to stay busy, so the output chunk queue has a higher limit than the input chunk queue limit.
 
+### S3 storage
+
+Chunk manager input references use the form `s3://<bucket>/<prefix>/<job_id>/input/<chunk_id>.jsonl`. The worker downloads each object to a temporary local file, reads the JSONL prompts, and removes the input file once its contents are in memory.
+
+Completed results are first written to one temporary local JSONL file, then uploaded to `s3://<bucket>/<prefix>/<job_id>/output/<chunk_id>/<generation>.jsonl`. Publication uses a conditional object create so a generation cannot overwrite different existing output; an identical existing object is accepted as an idempotent replay. The temporary output file is removed after the upload attempt.
+
+S3 calls run outside the asyncio event loop. A successful upload is the durable publication boundary, and the worker does not send `CompleteChunk` until publication is confirmed. If the lease becomes stale after upload, the generation-specific object is left in place and no completion is sent.
+
 
 ### Termination
 

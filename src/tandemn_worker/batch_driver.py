@@ -17,14 +17,18 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, cast
-from urllib.parse import unquote, urlparse
+from typing import Any, Protocol, TypeVar, cast
+from urllib.parse import quote, unquote, urlparse
 
+import boto3
 import grpc
 import httpx
+from boto3.exceptions import Boto3Error
+from botocore.exceptions import BotoCoreError, ClientError
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.rpc.error_details_pb2 import ErrorInfo
 from grpc_status import rpc_status
+from s3transfer.exceptions import S3DownloadFailedError
 
 from tandemn.chunkmanager.v1 import chunk_manager_pb2, chunk_manager_pb2_grpc
 from tandemn_worker.config import (
@@ -50,6 +54,7 @@ CHAIN_NOT_ACTIVE_REASON = "CHAIN_NOT_ACTIVE"
 LEASE_EXPIRED_REASON = "LEASE_EXPIRED"
 STALE_COMPLETION_REASONS = frozenset({"INVALID_STATE", "STALE_LEASE"})
 STALE_FAILURE_REASONS = frozenset({"INVALID_STATE", "LEASE_EXPIRED", "STALE_LEASE"})
+StorageResult = TypeVar("StorageResult")
 
 
 ########## Program lifecycle related classes and functions ##########
@@ -193,7 +198,6 @@ class LeaseState:
     finalization_result: asyncio.Future[bool] = field(
         default_factory=lambda: asyncio.get_running_loop().create_future()
     )
-    input_path: Path | None = None
     lifecycle_task: asyncio.Task[None] | None = None
 
     def __post_init__(self) -> None:
@@ -231,6 +235,31 @@ class OutputArtifact:
 
 class ChunkStorageError(Exception):
     """A storage operation failed and the chunk can be retried."""
+
+
+class S3Client(Protocol):
+    """Subset of the boto3 S3 client used by the batch driver."""
+
+    def download_file(self, bucket: str, key: str, filename: str) -> None: ...
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class S3ObjectRef:
+    """Parsed S3 bucket and object key."""
+
+    bucket: str
+    key: str
+
+    @property
+    def uri(self) -> str:
+        """Return the canonical S3 URI for this object."""
+        return f"s3://{self.bucket}/{quote(self.key, safe='/')}"
 
 
 @dataclass(slots=True)
@@ -346,6 +375,19 @@ async def wait_for_shutdown_or_timeout(event: asyncio.Event, delay_seconds: floa
     """Wait for shutdown while retaining an interruptible polling delay."""
     with suppress(TimeoutError):
         await asyncio.wait_for(event.wait(), timeout=jittered_delay(delay_seconds))
+
+
+async def run_storage_thread(  # noqa: UP047 - project supports Python 3.11
+    operation: Callable[..., StorageResult],
+    *args: Any,
+) -> StorageResult:
+    """Run blocking storage work without abandoning its resources on cancellation."""
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
 
 
 async def claim_chunk(
@@ -710,6 +752,7 @@ async def chunk_puller(
     chain: chunk_manager_pb2.ChainIdentity,
     config: ChunkManagerConfig,
     lease_tasks: set[asyncio.Task[None]],
+    s3_client: S3Client,
 ) -> None:
     """Claim chunks up to the local chunk limit without busy waiting."""
     shutdown_event = runtime.shutdown_event
@@ -774,7 +817,7 @@ async def chunk_puller(
                 runtime,
             )
             try:
-                chunk = await get_chunk(lease)
+                chunk = await get_chunk(lease, s3_client)
             except ChunkStorageError as exc:
                 try:
                     if not lease.stale_event.is_set():
@@ -1169,6 +1212,7 @@ async def chunk_writer(
     output_chunk_queue: asyncio.Queue[OutputChunk],
     metrics: DriverMetrics,
     chain: chunk_manager_pb2.ChainIdentity,
+    s3_client: S3Client,
 ) -> None:
     """Publish outputs and wait for authoritative manager completion."""
     while True:
@@ -1182,7 +1226,7 @@ async def chunk_writer(
                 continue
 
             try:
-                artifact = await put_chunk(completed_chunk, chain.job_id)
+                artifact = await put_chunk(completed_chunk, chain.job_id, s3_client)
             except ChunkStorageError as exc:
                 if not lease.stale_event.is_set():
                     await mark_chunk_failed(
@@ -1254,126 +1298,156 @@ async def finalize_lease(
     return await asyncio.shield(lease.finalization_result)
 
 
-def local_path_from_input_ref(input_ref: str) -> Path:
-    """Resolve a temporary local path adapter for a manager input reference."""
+def parse_s3_ref(input_ref: str) -> S3ObjectRef:
+    """Parse and validate an S3 object URI."""
     parsed = urlparse(input_ref)
-    if not parsed.scheme:
-        return Path(input_ref).expanduser().resolve()
-    if parsed.scheme != "file":
-        raise NotImplementedError(
-            f"Input reference scheme {parsed.scheme!r} is not supported; S3 support is pending"
-        )
-    if parsed.netloc not in {"", "localhost"}:
-        raise ValueError(f"File input reference has non-local authority {parsed.netloc!r}")
-    return Path(unquote(parsed.path)).expanduser().resolve()
+    if parsed.scheme != "s3":
+        raise ValueError(f"Input reference must use the s3 scheme, got {parsed.scheme!r}")
+    if not parsed.netloc:
+        raise ValueError("S3 input reference must include a bucket")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("S3 input reference must not include parameters, a query, or a fragment")
+
+    key = unquote(parsed.path.removeprefix("/"))
+    if not key:
+        raise ValueError("S3 input reference must include an object key")
+    return S3ObjectRef(bucket=parsed.netloc, key=key)
 
 
-async def get_chunk(lease: LeaseState) -> InputChunk:
-    """Read a claimed chunk through the temporary local-file storage adapter."""
+def output_ref_for_lease(lease: LeaseState, job_id: str) -> S3ObjectRef:
+    """Derive the generation-specific output object from a lease input URI."""
+    input_ref = parse_s3_ref(lease.input_ref)
+    input_suffix = f"{job_id}/input/{lease.chunk_id}.jsonl"
+    if input_ref.key == input_suffix:
+        output_prefix = ""
+    elif input_ref.key.endswith(f"/{input_suffix}"):
+        output_prefix = input_ref.key[: -len(input_suffix)]
+    else:
+        raise ValueError(f"S3 input key {input_ref.key!r} must end with {input_suffix!r}")
+
+    output_key = f"{output_prefix}{job_id}/output/{lease.chunk_id}/{lease.generation}.jsonl"
+    return S3ObjectRef(bucket=input_ref.bucket, key=output_key)
+
+
+def download_chunk_prompts(
+    s3_client: S3Client,
+    input_ref: S3ObjectRef,
+    lease: LeaseState,
+) -> list[str]:
+    """Download one input object to a temporary file and parse its lines."""
+    prefix = f"tandemn-input-{lease.chunk_id}-{lease.generation}-"
+    with tempfile.TemporaryDirectory(prefix=prefix) as temporary_directory:
+        input_path = Path(temporary_directory) / "input.jsonl"
+        s3_client.download_file(input_ref.bucket, input_ref.key, str(input_path))
+        return input_path.read_text(encoding="utf-8").splitlines()
+
+
+async def get_chunk(lease: LeaseState, s3_client: S3Client) -> InputChunk:
+    """Download a claimed S3 chunk through a temporary local file."""
+    input_ref = parse_s3_ref(lease.input_ref)
     try:
-        chunk_path = local_path_from_input_ref(lease.input_ref)
-        lease.input_path = chunk_path
-        prompts = await asyncio.to_thread(
-            lambda: chunk_path.read_text(encoding="utf-8").splitlines()
-        )
-    except OSError as exc:
+        prompts = await run_storage_thread(download_chunk_prompts, s3_client, input_ref, lease)
+    except (Boto3Error, BotoCoreError, ClientError, S3DownloadFailedError, OSError) as exc:
         raise ChunkStorageError(f"{exc.__class__.__name__}: {exc}") from exc
     return InputChunk(lease=lease, prompts=prompts)
 
 
-def fsync_directory(directory: Path) -> None:
-    """Persist directory entry changes on the local filesystem."""
-    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+def client_error_is_precondition_failed(error: ClientError) -> bool:
+    """Return whether S3 rejected a conditional create because the key exists."""
+    response = error.response
+    error_code = str(response.get("Error", {}).get("Code", ""))
+    status_code = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return status_code == 412 or error_code in {"PreconditionFailed", "412"}
+
+
+def read_s3_object(s3_client: S3Client, object_ref: S3ObjectRef) -> bytes:
+    """Read an S3 object's bytes and always close its response body."""
+    response = s3_client.get_object(Bucket=object_ref.bucket, Key=object_ref.key)
+    body = response["Body"]
     try:
-        os.fsync(descriptor)
+        content = body.read()
     finally:
-        os.close(descriptor)
+        body.close()
+    if not isinstance(content, bytes):
+        raise TypeError("S3 response body did not return bytes")
+    return content
 
 
-def fsync_file_and_directory(path: Path) -> None:
-    """Persist an existing output and the directory entry that names it."""
-    descriptor = os.open(path, os.O_RDONLY)
+def upload_output_file(
+    s3_client: S3Client,
+    output_ref: S3ObjectRef,
+    output_path: Path,
+    output_bytes: bytes,
+) -> None:
+    """Conditionally publish a local output file, accepting exact replays."""
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    fsync_directory(path.parent)
+        with output_path.open("rb") as output_file:
+            s3_client.put_object(
+                Bucket=output_ref.bucket,
+                Key=output_ref.key,
+                Body=output_file,
+                ContentLength=len(output_bytes),
+                IfNoneMatch="*",
+            )
+        return
+    except (Boto3Error, BotoCoreError, ClientError) as upload_error:
+        precondition_failed = isinstance(
+            upload_error, ClientError
+        ) and client_error_is_precondition_failed(upload_error)
 
-
-def create_output_directories(root: Path, output_directory: Path) -> None:
-    """Create and durably link each generation-specific output directory."""
-    current = root
-    for part in output_directory.relative_to(root).parts:
-        child = current / part
         try:
-            child.mkdir()
-        except FileExistsError:
-            if not child.is_dir():
+            existing_bytes = read_s3_object(s3_client, output_ref)
+        except (Boto3Error, BotoCoreError, ClientError):
+            if precondition_failed:
                 raise
-        fsync_directory(current)
-        current = child
+            raise upload_error from None
 
-
-def write_output_immutably(root: Path, output_path: Path, output_bytes: bytes) -> None:
-    """Durably publish output without replacing an existing generation artifact."""
-    create_output_directories(root, output_path.parent)
-    if output_path.exists():
-        if output_path.read_bytes() == output_bytes:
-            fsync_file_and_directory(output_path)
+        if existing_bytes == output_bytes:
             return
-        raise RuntimeError(f"Refusing to overwrite immutable output {output_path}")
-
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=output_path.parent,
-        prefix=f".{output_path.name}.",
-        suffix=".tmp",
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as output_file:
-            output_file.write(output_bytes)
-            output_file.flush()
-            os.fsync(output_file.fileno())
-
-        try:
-            os.link(temporary_path, output_path)
-        except FileExistsError:
-            if output_path.read_bytes() != output_bytes:
-                raise RuntimeError(
-                    f"Refusing to overwrite immutable output {output_path}"
-                ) from None
-        fsync_file_and_directory(output_path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
+        if precondition_failed:
+            raise RuntimeError(f"Refusing to overwrite immutable output {output_ref.uri}") from None
+        raise upload_error
 
 
-async def put_chunk(completed_chunk: OutputChunk, job_id: str) -> OutputArtifact:
-    """Write a completed chunk and return exact metadata for CompleteChunk."""
+def stage_and_upload_output(
+    s3_client: S3Client,
+    output_ref: S3ObjectRef,
+    lease: LeaseState,
+    output_bytes: bytes,
+) -> None:
+    """Write one local output file and upload it before removing the staging area."""
+    prefix = f"tandemn-output-{lease.chunk_id}-{lease.generation}-"
+    with tempfile.TemporaryDirectory(prefix=prefix) as temporary_directory:
+        output_path = Path(temporary_directory) / "output.jsonl"
+        output_path.write_bytes(output_bytes)
+        upload_output_file(s3_client, output_ref, output_path, output_bytes)
+
+
+async def put_chunk(
+    completed_chunk: OutputChunk,
+    job_id: str,
+    s3_client: S3Client,
+) -> OutputArtifact:
+    """Stage and publish a completed S3 chunk for CompleteChunk."""
     lease = completed_chunk.lease
-    if lease.input_path is None:
-        raise RuntimeError(f"Chunk {lease.chunk_id} has no resolved input path")
-
-    # Strip {job_id}/input/{chunk_id}.jsonl to recover the shared storage prefix.
-    storage_prefix = lease.input_path.parents[2]
-    output_path = (
-        storage_prefix / job_id / "output" / str(lease.chunk_id) / f"{lease.generation}.jsonl"
-    )
+    output_ref = output_ref_for_lease(lease, job_id)
     output_text = "\n".join(completed_chunk.outputs)
     if output_text:
         output_text += "\n"
     output_bytes = output_text.encode("utf-8")
 
     try:
-        await asyncio.to_thread(
-            write_output_immutably,
-            storage_prefix,
-            output_path,
+        await run_storage_thread(
+            stage_and_upload_output,
+            s3_client,
+            output_ref,
+            lease,
             output_bytes,
         )
-    except OSError as exc:
+    except (Boto3Error, BotoCoreError, ClientError, OSError) as exc:
         raise ChunkStorageError(f"{exc.__class__.__name__}: {exc}") from exc
     return OutputArtifact(
-        uri=output_path.as_uri(),
+        uri=output_ref.uri,
         checksum=f"sha256:{hashlib.sha256(output_bytes).hexdigest()}",
         size_bytes=len(output_bytes),
     )
@@ -1384,6 +1458,7 @@ async def main(config: BatchDriverConfig) -> int:
     runtime = DriverRuntime()
     loop = asyncio.get_running_loop()
     signals = (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1)
+    s3_client: S3Client = await asyncio.to_thread(boto3.client, "s3")
 
     ##### Housekeeping / Setup #####
 
@@ -1435,6 +1510,7 @@ async def main(config: BatchDriverConfig) -> int:
                 chain,
                 config.chunk_manager,
                 lease_tasks,
+                s3_client,
             ),
             runtime,
         ),
@@ -1459,7 +1535,7 @@ async def main(config: BatchDriverConfig) -> int:
     chunk_writer_task = asyncio.create_task(
         run_supervised(
             "chunk-writer",
-            lambda: chunk_writer(output_chunk_queue, metrics, chain),
+            lambda: chunk_writer(output_chunk_queue, metrics, chain, s3_client),
             runtime,
         ),
         name="chunk-writer",
@@ -1492,6 +1568,7 @@ async def main(config: BatchDriverConfig) -> int:
 
         await asyncio.gather(*tasks_to_stop, return_exceptions=True)
         await channel.close()
+        await asyncio.to_thread(s3_client.close)
         await stop_metrics_server(metrics_server, metrics_server_task)
         for signum in signals:
             loop.remove_signal_handler(signum)

@@ -4,16 +4,21 @@ import asyncio
 import hashlib
 import json
 import signal
+import threading
 from collections import deque
+from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
 import grpc
 import pytest
+from boto3.exceptions import RetriesExceededError
+from botocore.exceptions import ClientError
 from google.protobuf.any_pb2 import Any as AnyMessage
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.rpc.error_details_pb2 import ErrorInfo
 from google.rpc.status_pb2 import Status
+from s3transfer.exceptions import S3DownloadFailedError
 
 from tandemn.chunkmanager.v1 import chunk_manager_pb2, chunk_manager_pb2_grpc
 from tandemn_worker import batch_driver
@@ -114,6 +119,78 @@ class FakeWorkerStub:
         return response
 
 
+def s3_client_error(code: str, operation: str, status_code: int) -> ClientError:
+    return ClientError(
+        {
+            "Error": {"Code": code, "Message": code},
+            "ResponseMetadata": {"HTTPStatusCode": status_code},
+        },
+        operation,
+    )
+
+
+class FakeS3Client:
+    def __init__(self, objects: dict[tuple[str, str], bytes] | None = None) -> None:
+        self.objects = dict(objects or {})
+        self.download_requests: list[tuple[str, str, Path]] = []
+        self.put_requests: list[dict[str, Any]] = []
+        self.get_requests: list[tuple[str, str]] = []
+        self.download_error: BaseException | None = None
+        self.put_error: BaseException | None = None
+        self.commit_before_put_error = False
+        self.close_calls = 0
+
+    def download_file(self, bucket: str, key: str, filename: str) -> None:
+        destination = Path(filename)
+        self.download_requests.append((bucket, key, destination))
+        if self.download_error is not None:
+            raise self.download_error
+        try:
+            content = self.objects[(bucket, key)]
+        except KeyError:
+            raise s3_client_error("NoSuchKey", "GetObject", 404) from None
+        destination.write_bytes(content)
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        bucket = cast(str, kwargs["Bucket"])
+        key = cast(str, kwargs["Key"])
+        body = kwargs["Body"]
+        upload_path = Path(cast(str, body.name))
+        content = cast(bytes, body.read())
+        request = {
+            "Bucket": bucket,
+            "Key": key,
+            "Body": content,
+            "ContentLength": kwargs["ContentLength"],
+            "IfNoneMatch": kwargs["IfNoneMatch"],
+            "Path": upload_path,
+        }
+        self.put_requests.append(request)
+
+        if self.put_error is not None:
+            if self.commit_before_put_error:
+                self.objects[(bucket, key)] = content
+            raise self.put_error
+        if kwargs["IfNoneMatch"] == "*" and (bucket, key) in self.objects:
+            raise s3_client_error("PreconditionFailed", "PutObject", 412)
+
+        self.objects[(bucket, key)] = content
+        return {}
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        bucket = cast(str, kwargs["Bucket"])
+        key = cast(str, kwargs["Key"])
+        self.get_requests.append((bucket, key))
+        try:
+            content = self.objects[(bucket, key)]
+        except KeyError:
+            raise s3_client_error("NoSuchKey", "GetObject", 404) from None
+        return {"Body": BytesIO(content)}
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 def worker_stub(fake: FakeWorkerStub) -> chunk_manager_pb2_grpc.WorkerServiceStub:
     return cast(chunk_manager_pb2_grpc.WorkerServiceStub, cast(Any, fake))
 
@@ -128,6 +205,11 @@ def chain_identity() -> chunk_manager_pb2.ChainIdentity:
         rank_id="01K2H7M9NWV2Q8JGRF3B5TC6DY",
         chain_id=2,
     )
+
+
+def s3_input_ref(chunk_id: int = 7, *, prefix: str = "tenant-a") -> str:
+    key_prefix = f"{prefix}/" if prefix else ""
+    return f"s3://batch-bucket/{key_prefix}{chain_identity().job_id}/input/{chunk_id}.jsonl"
 
 
 def chunk_manager_config() -> ChunkManagerConfig:
@@ -169,14 +251,14 @@ def config_environment(**overrides: str) -> dict[str, str]:
 
 
 def lease_state(
-    input_ref: str = "/tmp/input.jsonl",
+    input_ref: str | None = None,
     *,
     next_renewal_at: float = 1_000_000_000.0,
 ) -> batch_driver.LeaseState:
     return batch_driver.LeaseState(
         chunk_id=7,
         generation=3,
-        input_ref=input_ref,
+        input_ref=input_ref or s3_input_ref(),
         next_renewal_at=next_renewal_at,
     )
 
@@ -322,7 +404,7 @@ async def test_claim_chunk_preserves_lease_and_uses_server_clock(
             chunk_manager_pb2.ChunkLease(
                 chunk_id=7,
                 generation=3,
-                input_ref="file:///data/input.jsonl",
+                input_ref=s3_input_ref(),
                 expires_at=timestamp(130),
             )
         ],
@@ -337,7 +419,7 @@ async def test_claim_chunk_preserves_lease_and_uses_server_clock(
     assert result.lease is not None
     assert result.lease.chunk_id == 7
     assert result.lease.generation == 3
-    assert result.lease.input_ref == "file:///data/input.jsonl"
+    assert result.lease.input_ref == s3_input_ref()
     assert result.lease.next_renewal_at == 115.0
     assert len(fake.claim_requests) == 1
     assert fake.claim_requests[0].chain == chain
@@ -423,7 +505,7 @@ async def test_lease_lifecycle_completes_exact_output_metadata() -> None:
         batch_driver.lease_lifecycle(worker_stub(fake), chain, lease, 1.0)
     )
     artifact = batch_driver.OutputArtifact(
-        uri="file:///tmp/output.jsonl",
+        uri="s3://batch-bucket/output.jsonl",
         checksum="sha256:abc",
         size_bytes=12,
     )
@@ -609,7 +691,7 @@ async def test_completion_renews_after_uncertain_result_and_replays_exact_reques
     request = chunk_manager_pb2.CompleteChunkRequest(
         chain=chain,
         lease=lease.reference(),
-        output_uri="file:///tmp/output.jsonl",
+        output_uri="s3://batch-bucket/output.jsonl",
         checksum="sha256:abc",
         output_size_bytes=12,
     )
@@ -658,7 +740,7 @@ async def test_slow_completion_is_interrupted_for_renewal(
     request = chunk_manager_pb2.CompleteChunkRequest(
         chain=chain,
         lease=lease.reference(),
-        output_uri="file:///tmp/output.jsonl",
+        output_uri="s3://batch-bucket/output.jsonl",
         checksum="sha256:abc",
         output_size_bytes=12,
     )
@@ -693,7 +775,7 @@ async def test_stale_completion_does_not_retry_renewal() -> None:
     request = chunk_manager_pb2.CompleteChunkRequest(
         chain=chain,
         lease=lease.reference(),
-        output_uri="file:///tmp/output.jsonl",
+        output_uri="s3://batch-bucket/output.jsonl",
         checksum="sha256:abc",
         output_size_bytes=12,
     )
@@ -734,6 +816,7 @@ async def test_chain_not_active_stops_claiming_and_drains() -> None:
         chain_identity(),
         chunk_manager_config(),
         set(),
+        FakeS3Client(),
     )
 
     assert runtime.shutdown_event.is_set()
@@ -745,17 +828,17 @@ async def test_chain_not_active_stops_claiming_and_drains() -> None:
 
 
 @pytest.mark.asyncio
-async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Path) -> None:
-    input_path = tmp_path / chain_identity().job_id / "input" / "7.jsonl"
-    input_path.parent.mkdir(parents=True)
-    input_path.write_text("", encoding="utf-8")
+async def test_draining_chain_completes_already_claimed_empty_chunk() -> None:
+    input_ref = s3_input_ref()
+    parsed_input = batch_driver.parse_s3_ref(input_ref)
+    s3_client = FakeS3Client({(parsed_input.bucket, parsed_input.key): b""})
     claim = chunk_manager_pb2.ClaimChunksResponse(
         job_state=chunk_manager_pb2.JOB_STATE_RUNNING,
         leases=[
             chunk_manager_pb2.ChunkLease(
                 chunk_id=7,
                 generation=3,
-                input_ref=input_path.as_uri(),
+                input_ref=input_ref,
                 expires_at=timestamp(130),
             )
         ],
@@ -780,7 +863,7 @@ async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Pa
     intake_done = asyncio.Event()
     lease_tasks: set[asyncio.Task[None]] = set()
     _, metrics = create_metrics_app(metrics_config())
-    writer = asyncio.create_task(batch_driver.chunk_writer(output_queue, metrics, chain))
+    writer = asyncio.create_task(batch_driver.chunk_writer(output_queue, metrics, chain, s3_client))
 
     try:
         await batch_driver.chunk_puller(
@@ -794,6 +877,7 @@ async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Pa
             chain,
             chunk_manager_config(),
             lease_tasks,
+            s3_client,
         )
         await asyncio.wait_for(output_queue.join(), timeout=1)
         while lease_tasks:
@@ -806,8 +890,14 @@ async def test_draining_chain_completes_already_claimed_empty_chunk(tmp_path: Pa
     assert runtime.return_code == int(batch_driver.DriverRuntime.ReturnCode.CHAIN_NOT_ACTIVE)
     assert intake_done.is_set()
     assert len(fake.completion_requests) == 1
-    assert fake.completion_requests[0].lease.chunk_id == 7
-    assert fake.completion_requests[0].lease.generation == 3
+    output_ref = batch_driver.output_ref_for_lease(lease_state(input_ref), chain.job_id)
+    completion = fake.completion_requests[0]
+    assert completion.lease.chunk_id == 7
+    assert completion.lease.generation == 3
+    assert completion.output_uri == output_ref.uri
+    assert completion.checksum == f"sha256:{hashlib.sha256(b'').hexdigest()}"
+    assert completion.output_size_bytes == 0
+    assert s3_client.objects[(output_ref.bucket, output_ref.key)] == b""
 
 
 @pytest.mark.asyncio
@@ -843,6 +933,7 @@ async def test_terminal_job_discards_local_work_without_drain(job_state: int) ->
         chain_identity(),
         chunk_manager_config(),
         set(),
+        FakeS3Client(),
     )
 
     assert runtime.shutdown_event.is_set()
@@ -1017,63 +1108,165 @@ async def test_drain_waits_for_output_and_lease_tasks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_local_file_adapter_writes_immutable_generation_output(tmp_path: Path) -> None:
-    input_path = tmp_path / chain_identity().job_id / "input" / "7.jsonl"
-    input_path.parent.mkdir(parents=True)
-    input_path.write_text("first\nsecond\n", encoding="utf-8")
-    lease = lease_state(input_path.as_uri())
+async def test_s3_storage_stages_files_and_writes_immutable_generation_output() -> None:
+    input_ref = s3_input_ref(prefix="tenant-a/batch inputs")
+    parsed_input = batch_driver.parse_s3_ref(input_ref)
+    s3_client = FakeS3Client({(parsed_input.bucket, parsed_input.key): b"first\nsecond\n"})
+    lease = lease_state(input_ref)
 
-    input_chunk = await batch_driver.get_chunk(lease)
+    input_chunk = await batch_driver.get_chunk(lease, s3_client)
     assert input_chunk.prompts == ["first", "second"]
+    assert len(s3_client.download_requests) == 1
+    bucket, key, downloaded_path = s3_client.download_requests[0]
+    assert (bucket, key) == (parsed_input.bucket, parsed_input.key)
+    assert downloaded_path.name == "input.jsonl"
+    assert not downloaded_path.exists()
 
     output_chunk = batch_driver.OutputChunk(lease=lease, outputs=["one", "two"])
-    artifact = await batch_driver.put_chunk(output_chunk, chain_identity().job_id)
-    output_path = tmp_path / chain_identity().job_id / "output" / "7" / "3.jsonl"
+    artifact = await batch_driver.put_chunk(
+        output_chunk,
+        chain_identity().job_id,
+        s3_client,
+    )
+    output_ref = batch_driver.output_ref_for_lease(lease, chain_identity().job_id)
     expected = b"one\ntwo\n"
 
-    assert output_path.read_bytes() == expected
-    assert artifact.uri == output_path.as_uri()
+    assert s3_client.objects[(output_ref.bucket, output_ref.key)] == expected
+    assert artifact.uri == output_ref.uri
     assert artifact.checksum == f"sha256:{hashlib.sha256(expected).hexdigest()}"
     assert artifact.size_bytes == len(expected)
-    assert await batch_driver.put_chunk(output_chunk, chain_identity().job_id) == artifact
-
-    concurrent_lease = batch_driver.LeaseState(
-        chunk_id=7,
-        generation=4,
-        input_ref=input_path.as_uri(),
-        next_renewal_at=1_000_000_000.0,
-        input_path=input_path,
+    assert s3_client.put_requests[0]["Body"] == expected
+    assert s3_client.put_requests[0]["ContentLength"] == len(expected)
+    assert s3_client.put_requests[0]["IfNoneMatch"] == "*"
+    assert not cast(Path, s3_client.put_requests[0]["Path"]).exists()
+    assert (
+        await batch_driver.put_chunk(
+            output_chunk,
+            chain_identity().job_id,
+            s3_client,
+        )
+        == artifact
     )
-    concurrent_chunk = batch_driver.OutputChunk(
-        lease=concurrent_lease,
-        outputs=["same"],
-    )
-    first, second = await asyncio.gather(
-        batch_driver.put_chunk(concurrent_chunk, chain_identity().job_id),
-        batch_driver.put_chunk(concurrent_chunk, chain_identity().job_id),
-    )
-    assert first == second
+    assert s3_client.get_requests == [(output_ref.bucket, output_ref.key)]
 
     with pytest.raises(RuntimeError, match="immutable output"):
         await batch_driver.put_chunk(
             batch_driver.OutputChunk(lease=lease, outputs=["different"]),
             chain_identity().job_id,
+            s3_client,
         )
 
 
-def test_local_file_adapter_rejects_remote_schemes(tmp_path: Path) -> None:
-    assert batch_driver.local_path_from_input_ref(str(tmp_path)) == tmp_path
-    assert batch_driver.local_path_from_input_ref(tmp_path.as_uri()) == tmp_path
+@pytest.mark.asyncio
+async def test_s3_upload_reconciles_an_uncertain_success() -> None:
+    s3_client = FakeS3Client()
+    s3_client.put_error = s3_client_error("RequestTimeout", "PutObject", 400)
+    s3_client.commit_before_put_error = True
+    output = batch_driver.OutputChunk(lease=lease_state(), outputs=["completed"])
 
-    with pytest.raises(NotImplementedError, match="S3 support is pending"):
-        batch_driver.local_path_from_input_ref("s3://bucket/chunk.jsonl")
-    with pytest.raises(ValueError, match="non-local authority"):
-        batch_driver.local_path_from_input_ref("file://remote/chunk.jsonl")
+    artifact = await batch_driver.put_chunk(output, chain_identity().job_id, s3_client)
+
+    output_ref = batch_driver.output_ref_for_lease(output.lease, chain_identity().job_id)
+    assert artifact.uri == output_ref.uri
+    assert s3_client.objects[(output_ref.bucket, output_ref.key)] == b"completed\n"
+    assert s3_client.get_requests == [(output_ref.bucket, output_ref.key)]
 
 
 @pytest.mark.asyncio
-async def test_stale_queued_chunk_skips_vllm_and_releases_capacity(tmp_path: Path) -> None:
-    lease = lease_state(str(tmp_path / "input.jsonl"))
+async def test_storage_cancellation_waits_for_local_staging_cleanup() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingS3Client(FakeS3Client):
+        def download_file(self, bucket: str, key: str, filename: str) -> None:
+            started.set()
+            if not release.wait(timeout=1):
+                raise TimeoutError("test did not release download")
+            super().download_file(bucket, key, filename)
+
+    input_ref = s3_input_ref()
+    parsed_input = batch_driver.parse_s3_ref(input_ref)
+    s3_client = BlockingS3Client({(parsed_input.bucket, parsed_input.key): b"prompt\n"})
+    download = asyncio.create_task(batch_driver.get_chunk(lease_state(input_ref), s3_client))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    download.cancel()
+    await asyncio.sleep(0)
+    assert not download.done()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await download
+    assert not s3_client.download_requests[0][2].exists()
+
+
+@pytest.mark.asyncio
+async def test_s3_reference_parsing_and_output_derivation() -> None:
+    input_ref = s3_input_ref(prefix="nested/batch inputs")
+    parsed = batch_driver.parse_s3_ref(input_ref)
+    lease = lease_state(input_ref)
+
+    assert parsed == batch_driver.S3ObjectRef(
+        bucket="batch-bucket",
+        key=f"nested/batch inputs/{chain_identity().job_id}/input/7.jsonl",
+    )
+    assert parsed.uri == (
+        f"s3://batch-bucket/nested/batch%20inputs/{chain_identity().job_id}/input/7.jsonl"
+    )
+    assert batch_driver.output_ref_for_lease(lease, chain_identity().job_id) == (
+        batch_driver.S3ObjectRef(
+            bucket="batch-bucket",
+            key=f"nested/batch inputs/{chain_identity().job_id}/output/7/3.jsonl",
+        )
+    )
+
+    root_input = lease_state(s3_input_ref(prefix=""))
+    assert batch_driver.output_ref_for_lease(root_input, chain_identity().job_id).key == (
+        f"{chain_identity().job_id}/output/7/3.jsonl"
+    )
+
+    repeated_slash_input = lease_state(
+        f"s3://batch-bucket/nested//{chain_identity().job_id}/input/7.jsonl"
+    )
+    assert (
+        batch_driver.output_ref_for_lease(repeated_slash_input, chain_identity().job_id).key
+        == f"nested//{chain_identity().job_id}/output/7/3.jsonl"
+    )
+
+    leading_slash_input = lease_state(f"s3://batch-bucket//{chain_identity().job_id}/input/7.jsonl")
+    assert (
+        batch_driver.output_ref_for_lease(leading_slash_input, chain_identity().job_id).key
+        == f"/{chain_identity().job_id}/output/7/3.jsonl"
+    )
+
+
+@pytest.mark.parametrize(
+    "input_ref",
+    [
+        "/tmp/input.jsonl",
+        "file:///tmp/input.jsonl",
+        "s3:///input.jsonl",
+        "s3://batch-bucket",
+        "s3://batch-bucket/input.jsonl?versionId=1",
+        "s3://batch-bucket/input.jsonl#fragment",
+    ],
+)
+def test_s3_reference_rejects_invalid_uris(input_ref: str) -> None:
+    with pytest.raises(ValueError):
+        batch_driver.parse_s3_ref(input_ref)
+
+
+@pytest.mark.asyncio
+async def test_s3_output_derivation_rejects_unexpected_input_layout() -> None:
+    lease = lease_state("s3://batch-bucket/unrelated/input.jsonl")
+
+    with pytest.raises(ValueError, match="must end with"):
+        batch_driver.output_ref_for_lease(lease, chain_identity().job_id)
+
+
+@pytest.mark.asyncio
+async def test_stale_queued_chunk_skips_vllm_and_releases_capacity() -> None:
+    lease = lease_state()
     lease.stale_event.set()
     chunk = batch_driver.InputChunk(lease=lease, prompts=["unused"])
     chunk_sem = asyncio.BoundedSemaphore(1)
@@ -1231,7 +1424,7 @@ async def test_chunk_read_failure_is_reported_and_intake_continues(
             chunk_manager_pb2.ChunkLease(
                 chunk_id=7,
                 generation=3,
-                input_ref="file:///missing/input.jsonl",
+                input_ref=s3_input_ref(),
                 expires_at=timestamp(130),
             )
         ],
@@ -1251,8 +1444,11 @@ async def test_chunk_read_failure_is_reported_and_intake_continues(
         ],
     )
 
-    async def fail_read(_lease: batch_driver.LeaseState) -> batch_driver.InputChunk:
-        raise batch_driver.ChunkStorageError("FileNotFoundError: missing chunk")
+    async def fail_read(
+        _lease: batch_driver.LeaseState,
+        _s3_client: batch_driver.S3Client,
+    ) -> batch_driver.InputChunk:
+        raise batch_driver.ChunkStorageError("ClientError: missing chunk")
 
     monkeypatch.setattr(batch_driver, "get_chunk", fail_read)
     chunk_sem = asyncio.BoundedSemaphore(1)
@@ -1274,6 +1470,7 @@ async def test_chunk_read_failure_is_reported_and_intake_continues(
         chain_identity(),
         chunk_manager_config(),
         lease_tasks,
+        FakeS3Client(),
     )
     await asyncio.gather(*tuple(lease_tasks))
 
@@ -1283,7 +1480,7 @@ async def test_chunk_read_failure_is_reported_and_intake_continues(
     assert request.lease.chunk_id == 7
     assert request.lease.generation == 3
     assert request.failure_class == "STORAGE_READ_ERROR"
-    assert request.message == "FileNotFoundError: missing chunk"
+    assert request.message == "ClientError: missing chunk"
     assert request.retriable
     assert input_queue.empty()
     assert output_queue.empty()
@@ -1299,7 +1496,7 @@ async def test_chunk_write_failure_is_reported_and_writer_continues(
     successful_lease = batch_driver.LeaseState(
         chunk_id=8,
         generation=4,
-        input_ref="/tmp/input-8.jsonl",
+        input_ref=s3_input_ref(8),
         next_renewal_at=1_000_000_000.0,
     )
     fake = FakeWorkerStub(
@@ -1325,11 +1522,12 @@ async def test_chunk_write_failure_is_reported_and_writer_continues(
     async def put_chunk(
         chunk: batch_driver.OutputChunk,
         _job_id: str,
+        _s3_client: batch_driver.S3Client,
     ) -> batch_driver.OutputArtifact:
         if chunk.chunk_id == failed_lease.chunk_id:
             raise batch_driver.ChunkStorageError("PermissionError: write failed")
         return batch_driver.OutputArtifact(
-            uri="file:///tmp/output-8.jsonl",
+            uri="s3://batch-bucket/output-8.jsonl",
             checksum="sha256:abc",
             size_bytes=12,
         )
@@ -1339,7 +1537,9 @@ async def test_chunk_write_failure_is_reported_and_writer_continues(
     await output_queue.put(batch_driver.OutputChunk(lease=failed_lease, outputs=["failed"]))
     await output_queue.put(batch_driver.OutputChunk(lease=successful_lease, outputs=["successful"]))
     _, metrics = create_metrics_app(metrics_config())
-    writer = asyncio.create_task(batch_driver.chunk_writer(output_queue, metrics, chain))
+    writer = asyncio.create_task(
+        batch_driver.chunk_writer(output_queue, metrics, chain, FakeS3Client())
+    )
 
     try:
         await asyncio.wait_for(output_queue.join(), timeout=1)
@@ -1360,26 +1560,31 @@ async def test_chunk_write_failure_is_reported_and_writer_continues(
 
 
 @pytest.mark.asyncio
-async def test_local_storage_io_errors_are_retriable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    input_path = tmp_path / chain_identity().job_id / "input" / "7.jsonl"
-    missing_lease = lease_state(input_path.as_uri())
-    with pytest.raises(batch_driver.ChunkStorageError, match="FileNotFoundError"):
-        await batch_driver.get_chunk(missing_lease)
+async def test_s3_storage_errors_are_retriable() -> None:
+    read_client = FakeS3Client()
+    with pytest.raises(batch_driver.ChunkStorageError, match="ClientError"):
+        await batch_driver.get_chunk(lease_state(), read_client)
+    assert not read_client.download_requests[0][2].exists()
 
-    input_path.parent.mkdir(parents=True)
-    input_path.write_text("prompt\n", encoding="utf-8")
-    output_lease = lease_state(input_path.as_uri())
-    output_lease.input_path = input_path
-
-    def fail_write(_root: Path, _path: Path, _output: bytes) -> None:
-        raise PermissionError("write denied")
-
-    monkeypatch.setattr(batch_driver, "write_output_immutably", fail_write)
-    with pytest.raises(batch_driver.ChunkStorageError, match="PermissionError: write denied"):
+    write_client = FakeS3Client()
+    write_client.put_error = s3_client_error("AccessDenied", "PutObject", 403)
+    with pytest.raises(batch_driver.ChunkStorageError, match="ClientError"):
         await batch_driver.put_chunk(
-            batch_driver.OutputChunk(lease=output_lease, outputs=["output"]),
+            batch_driver.OutputChunk(lease=lease_state(), outputs=["output"]),
             chain_identity().job_id,
+            write_client,
         )
+    assert not cast(Path, write_client.put_requests[0]["Path"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_s3_transfer_failures_are_chunk_storage_errors() -> None:
+    s3_client = FakeS3Client()
+    s3_client.download_error = RetriesExceededError(TimeoutError("read timed out"))
+
+    with pytest.raises(batch_driver.ChunkStorageError, match="RetriesExceededError"):
+        await batch_driver.get_chunk(lease_state(), s3_client)
+
+    s3_client.download_error = S3DownloadFailedError("object changed during download")
+    with pytest.raises(batch_driver.ChunkStorageError, match="S3DownloadFailedError"):
+        await batch_driver.get_chunk(lease_state(), s3_client)
