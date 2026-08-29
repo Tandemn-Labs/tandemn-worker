@@ -1,4 +1,4 @@
-ARG VLLM_IMAGE=vllm/vllm-openai:v0.22.1
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.28.0@sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14
 FROM ghcr.io/astral-sh/uv:0.12.5 AS uv
 FROM ${VLLM_IMAGE}
 
@@ -6,19 +6,19 @@ WORKDIR /app
 
 # Write logs immediately instead of buffering
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/src
+    PYTHONPATH=/app/src \
+    TD_VLLM_EXECUTABLE=/usr/local/bin/vllm
 
-COPY pyproject.toml ./
 COPY --from=uv /uv /usr/local/bin/uv
-RUN uv pip install --system --no-cache \
-    "googleapis-common-protos" \
-    "grpcio>=1.83.0,<2" \
-    "grpcio-status>=1.83.0,<2" \
-    "protobuf>=7.35.1,<8"
+COPY pyproject.toml uv.lock ./
+RUN UV_PROJECT_ENVIRONMENT=/opt/tandemn-worker-venv \
+    uv sync --locked --no-dev --no-install-project --no-cache \
+    --python /usr/bin/python3 --no-python-downloads
 
 COPY src ./src
 
 # The official vLLM image starts the OpenAI server by default. This worker image
 # owns its process entrypoint and can still run `vllm serve` explicitly later.
+# Keep the worker venv off PATH so the vLLM executable retains its base-image Python.
 ENTRYPOINT []
-CMD ["python", "-m", "tandemn_worker.supervisor"]
+CMD ["/opt/tandemn-worker-venv/bin/python", "-m", "tandemn_worker.supervisor"]
