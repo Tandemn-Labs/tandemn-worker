@@ -43,7 +43,7 @@ spec:
           envFrom:
             - secretRef:
                 name: tandemn-worker-secrets
-                optional: true
+                optional: false
 
           ports:
             - name: metrics
